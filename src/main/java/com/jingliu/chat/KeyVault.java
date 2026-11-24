@@ -62,6 +62,26 @@ final class KeyVault {
         return generator.generateKey();
     }
 
+    synchronized String sealProxyCredentials(String username, String password) throws Exception {
+        if (username.isEmpty()) return "";
+        JSONObject credentials = new JSONObject().put("username", username).put("password", password);
+        Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+        cipher.init(Cipher.ENCRYPT_MODE, secret());
+        byte[] encoded = cipher.doFinal(credentials.toString().getBytes(StandardCharsets.UTF_8));
+        return Base64.encodeToString(cipher.getIV(), Base64.NO_WRAP) + "." + Base64.encodeToString(encoded, Base64.NO_WRAP);
+    }
+
+    synchronized java.net.PasswordAuthentication openProxyCredentials(String stored) throws Exception {
+        if (stored.isEmpty()) return null;
+        String[] parts = stored.split("[.]", 2);
+        byte[] iv = Base64.decode(parts[0], Base64.NO_WRAP);
+        byte[] encoded = Base64.decode(parts[1], Base64.NO_WRAP);
+        Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+        cipher.init(Cipher.DECRYPT_MODE, secret(), new GCMParameterSpec(128, iv));
+        JSONObject credentials = new JSONObject(new String(cipher.doFinal(encoded), StandardCharsets.UTF_8));
+        return new java.net.PasswordAuthentication(credentials.getString("username"), credentials.getString("password").toCharArray());
+    }
+
     private String prefix(String endpoint) {
         if (endpoint.isEmpty()) return "";
         try {

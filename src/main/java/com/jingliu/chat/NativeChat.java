@@ -68,7 +68,7 @@ final class NativeChat {
     private String providerNameDraft, pendingProviderName, keyManagementEndpoint;
     private int screen;
     private JSONObject editedOptionsChat;
-    private static final int CHAT = 0, SETTINGS = 1, API_SETTINGS = 2, FONT_SETTINGS = 3, MODEL_SETTINGS = 4, KEY_SETTINGS = 5;
+    private static final int CHAT = 0, SETTINGS = 1, API_SETTINGS = 2, FONT_SETTINGS = 3, MODEL_SETTINGS = 4, KEY_SETTINGS = 5, ABOUT = 6;
     private enum Motion { NONE, PUSH, POP, FADE }
     private static final PathInterpolator EASE = new PathInterpolator(.22f, .75f, .23f, 1f);
     private View screenView;
@@ -208,6 +208,7 @@ final class NativeChat {
             else if (screen == KEY_SETTINGS) buildKeySettings();
             else if (screen == FONT_SETTINGS) buildFontSettings();
             else if (screen == MODEL_SETTINGS) buildModelSettings();
+            else if (screen == ABOUT) buildAbout();
             else buildSettingsHome();
             screenView = layout;
         }
@@ -252,7 +253,7 @@ final class NativeChat {
                 returnToChat(false);
                 return true;
             }
-            if (screen == FONT_SETTINGS) {
+            if (screen == FONT_SETTINGS || screen == ABOUT) {
                 screen = SETTINGS;
                 show(Motion.POP, false);
                 return true;
@@ -410,8 +411,14 @@ final class NativeChat {
             FrameLayout.LayoutParams trailing = new FrameLayout.LayoutParams(dp(48), dp(48), Gravity.END | Gravity.CENTER_VERTICAL);
             trailing.setMarginEnd(dp(8));
             bar.addView(icon(R.drawable.ic_plus, "新对话", () -> activate(null)), trailing);
+            boolean showLog = services.requestLoggingEnabled();
+            if (showLog) {
+                FrameLayout.LayoutParams logs = new FrameLayout.LayoutParams(dp(44), dp(48), Gravity.END | Gravity.CENTER_VERTICAL);
+                logs.setMarginEnd(dp(56));
+                bar.addView(icon(R.drawable.ic_request_log, "请求日志", this::showRequestLogs), logs);
+            }
             FrameLayout.LayoutParams options = new FrameLayout.LayoutParams(dp(44), dp(48), Gravity.END | Gravity.CENTER_VERTICAL);
-            options.setMarginEnd(dp(56));
+            options.setMarginEnd(dp(showLog ? 100 : 56));
             chatOptions = icon(R.drawable.ic_settings, "对话高级设置", this::openChatOptions);
             bar.addView(chatOptions, options);
         }
@@ -743,7 +750,7 @@ final class NativeChat {
         boolean canEdit = chat != null;
         chatOptions.setVisibility(canEdit ? View.VISIBLE : View.GONE);
         FrameLayout.LayoutParams titleArea = (FrameLayout.LayoutParams) chatTitles.getLayoutParams();
-        int end = dp(canEdit ? 104 : 61);
+        int end = dp(61 + (canEdit ? 43 : 0) + (services.requestLoggingEnabled() ? 44 : 0));
         if (titleArea.getMarginEnd() != end) {
             titleArea.setMarginEnd(end);
             chatTitles.setLayoutParams(titleArea);
@@ -833,7 +840,7 @@ final class NativeChat {
     private void submit() {
         if (state.job != null) {
             services.cancel(state.job.id);
-            finish("已停止");
+            finish(state.job, "已停止");
             return;
         }
         if (busy() || !requireKey() || !allowProvider()) return;
@@ -938,11 +945,12 @@ final class NativeChat {
         renderMessages(true);
         controls();
         if (drawer.isRevealed()) refreshHistory();
-        services.stream(job.id, job.endpoint, job.request.toString(), state.data.optBoolean("compactContext", true),
+        services.stream(job.id, string(job.chat, "id"), state.apiProvider(), job.endpoint, job.request.toString(), state.data.optBoolean("compactContext", true),
             job.attachmentKey);
     }
-    private void finish(String error) {
+    private void finish(ChatState.Job completed, String error) {
         state.finish(error);
+        unfolded.remove(completed.reply);
         save();
         if (screen == CHAT) {
             boolean follow = nearBottom();
@@ -1251,6 +1259,54 @@ final class NativeChat {
         panel.addView(bar, MATCH_PARENT, dp(50));
         divider(panel);
         return panel;
+    }
+
+    private void showRequestLogs() {
+        services.hideKeyboard();
+        Dialog dialog = newSheet();
+        LinearLayout panel = settingsSheet(dialog, "请求日志");
+        List<RequestLog.Entry> entries = services.requestLogs(string(state.current(), "id"));
+        if (entries.isEmpty()) {
+            settingsNote(panel, "当前对话暂无请求日志。发送消息后可在这里查看。");
+        } else {
+            settingsNote(panel, "日志仅保存在本次运行中，可能包含对话内容。");
+            ScrollView scroll = sheetScroll(.60f);
+            LinearLayout rows = vertical();
+            scroll.addView(rows, MATCH_PARENT, WRAP_CONTENT);
+            panel.addView(scroll, MATCH_PARENT, WRAP_CONTENT);
+            java.text.DateFormat clock = android.text.format.DateFormat.getTimeFormat(context);
+            for (RequestLog.Entry entry : entries) {
+                if (rows.getChildCount() > 0) divider(rows);
+                settingsRow(rows, R.drawable.ic_request_log,
+                    clock.format(new java.util.Date(entry.started)) + " · " + entry.provider, entry.state(), () -> {
+                        dialog.dismiss();
+                        showRequestLog(entry);
+                    });
+            }
+        }
+        showSheet(dialog, panel);
+    }
+
+    private void showRequestLog(RequestLog.Entry entry) {
+        Dialog dialog = newSheet();
+        LinearLayout panel = settingsSheet(dialog, "请求详情");
+        ScrollView scroll = sheetScroll(.59f);
+        TextView detail = text(entry.details(), 12, ink);
+        detail.setTypeface(Typeface.MONOSPACE);
+        detail.setTextIsSelectable(true);
+        pad(detail, 10, 10);
+        scroll.addView(detail, MATCH_PARENT, WRAP_CONTENT);
+        panel.addView(scroll, MATCH_PARENT, WRAP_CONTENT);
+        LinearLayout actions = horizontal();
+        actions.addView(action("返回列表", () -> {
+            dialog.dismiss();
+            showRequestLogs();
+        }));
+        weight(actions);
+        actions.addView(action("刷新", () -> detail.setText(entry.details())));
+        actions.addView(action("复制日志", () -> copy(entry.details())));
+        panel.addView(actions, MATCH_PARENT, WRAP_CONTENT);
+        showSheet(dialog, panel);
     }
 
     private void choiceSheet(String title, String[] options, int selected, java.util.function.IntConsumer select) {
@@ -1891,6 +1947,18 @@ final class NativeChat {
         settingsRow(connection, R.drawable.ic_server, "API 设置",
             state.providerName(state.apiProvider()), this::openApiSettings);
         divider(connection);
+        settingsRow(connection, R.drawable.ic_server, "SOCKS5 代理", "", this::showProxyProviders);
+        divider(connection);
+        LinearLayout logRow = settingsLine(connection, R.drawable.ic_request_log);
+        Switch logging = new Switch(context);
+        logging.setText("记录请求日志");
+        logging.setTextColor(ink);
+        logging.setTextSize(15);
+        logging.setChecked(services.requestLoggingEnabled());
+        logging.setOnCheckedChangeListener((view, enabled) -> services.setRequestLoggingEnabled(enabled));
+        logging.setPaddingRelative(dp(11), 0, 0, 0);
+        logRow.addView(logging, new LinearLayout.LayoutParams(0, MATCH_PARENT, 1));
+        divider(connection);
         settingsRow(connection, R.drawable.ic_manage, "管理对话", "", () -> {
             historyFilter = "";
             selectedChats.clear();
@@ -1934,39 +2002,129 @@ final class NativeChat {
         });
 
         LinearLayout about = settingsGroup(body, "关于");
-        String version = "";
-        try {
-            version = host.getPackageManager().getPackageInfo(host.getPackageName(), 0).versionName;
-        } catch (PackageManager.NameNotFoundException ignored) {
-        }
-        settingsRow(about, R.drawable.ic_mark, "应用版本", version, null);
-        divider(about);
-        settingsRow(about, R.drawable.ic_continue, "检查更新", "", () -> {
+        settingsRow(about, R.drawable.ic_continue, "检查更新", appVersion(), () -> {
             toast("正在检查更新");
             services.checkUpdate(true);
         });
+        divider(about);
+        settingsRow(about, R.drawable.ic_mark, "关于 Asteria", "", () -> {
+            screen = ABOUT;
+            show(Motion.PUSH, false);
+        });
     }
 
-    void updateAvailable(String tag, boolean requested) {
-        if (tag == null || tag.isEmpty()) {
-            if (requested) toast(tag == null ? "暂时无法检查更新" : "当前已是最新版本");
+    private String appVersion() {
+        try {
+            android.content.pm.PackageInfo info = host.getPackageManager().getPackageInfo(host.getPackageName(), 0);
+            long build = android.os.Build.VERSION.SDK_INT >= 28 ? info.getLongVersionCode() : info.versionCode;
+            return info.versionName + " (" + build + ")";
+        } catch (PackageManager.NameNotFoundException ignored) {
+            return "";
+        }
+    }
+
+    private void buildAbout() {
+        header("关于 Asteria", R.drawable.ic_back, "返回", this::back, false);
+        ScrollView scroll = new ScrollView(context);
+        layout.addView(scroll, new LinearLayout.LayoutParams(MATCH_PARENT, 0, 1));
+        LinearLayout body = vertical();
+        pad(body, 16, 10);
+        scroll.addView(body, MATCH_PARENT, WRAP_CONTENT);
+
+        LinearLayout brand = vertical();
+        brand.setGravity(Gravity.CENTER_HORIZONTAL);
+        gap(brand, 18);
+        ImageView mark = new ImageView(context);
+        mark.setImageResource(R.drawable.ic_mark);
+        mark.setImageTintList(ColorStateList.valueOf(blue));
+        mark.setScaleType(ImageView.ScaleType.CENTER);
+        mark.setBackground(box(tint, 0, 22));
+        brand.addView(mark, dp(66), dp(66));
+        gap(brand, 12);
+        TextView name = text("Asteria", 24, ink);
+        bold(name);
+        brand.addView(name);
+        String version = appVersion();
+        if (!version.isEmpty()) brand.addView(text(version, 13, muted));
+        gap(brand, 11);
+        TextView description = text("开源原生 Android 聊天客户端，支持 DeepSeek 和 OpenAI 兼容接口。", 14, muted);
+        description.setGravity(Gravity.CENTER);
+        pad(description, 16, 0);
+        brand.addView(description, MATCH_PARENT, WRAP_CONTENT);
+        body.addView(brand, MATCH_PARENT, WRAP_CONTENT);
+
+        LinearLayout project = settingsGroup(body, "项目");
+        settingsRow(project, R.drawable.ic_globe, "官网与源码", "GitHub", () -> services.open(AppUpdate.PROJECT_URL));
+        divider(project);
+        settingsRow(project, R.drawable.ic_continue, "发布记录", "", () -> services.open(AppUpdate.RELEASES_URL));
+        divider(project);
+        settingsRow(project, R.drawable.ic_edit, "问题反馈", "", () -> services.open(AppUpdate.PROJECT_URL + "/issues"));
+        divider(project);
+        settingsRow(project, R.drawable.ic_request_log, "开源许可证", "MIT", () -> services.open(AppUpdate.PROJECT_URL + "/blob/main/LICENSE"));
+    }
+
+    void updateAvailable(java.util.Optional<AppUpdate.Release> result, boolean requested) {
+        if (result == null || !result.isPresent()) {
+            if (requested) toast(result == null ? "暂时无法检查更新" : "当前已是最新版本");
             return;
         }
-        if (!requested && tag.equals(offeredUpdate)) return;
-        offeredUpdate = tag;
+        AppUpdate.Release release = result.get();
+        if (!requested && release.tag.equals(offeredUpdate)) return;
+        offeredUpdate = release.tag;
         Dialog dialog = newSheet();
-        LinearLayout panel = settingsSheet(dialog, "发现新版本 " + tag);
-        boolean mirror = AppUpdate.preferMirror(java.util.Locale.getDefault());
-        TextView alternate = action(mirror ? "GitHub 直连下载" : "镜像下载", () -> {
+        LinearLayout panel = sheetPanel();
+        pad(panel, 20, 18);
+
+        LinearLayout titleRow = horizontal();
+        titleRow.setGravity(Gravity.CENTER_VERTICAL);
+        ImageView mark = new ImageView(context);
+        mark.setImageResource(R.drawable.ic_mark);
+        mark.setImageTintList(ColorStateList.valueOf(blueSolid));
+        mark.setBackground(box(tint, 0, 14));
+        pad(mark, 11, 11);
+        titleRow.addView(mark, dp(46), dp(46));
+        LinearLayout heading = vertical();
+        pad(heading, 12, 0);
+        TextView title = text("发现新版本", 20, ink);
+        bold(title);
+        heading.addView(title);
+        heading.addView(text("Asteria " + release.tag.replaceFirst("^v", ""), 13, blueSolid));
+        titleRow.addView(heading, new LinearLayout.LayoutParams(0, WRAP_CONTENT, 1));
+        panel.addView(titleRow, MATCH_PARENT, WRAP_CONTENT);
+        gap(panel, 16);
+        divider(panel);
+        gap(panel, 12);
+        TextView notesTitle = text("更新内容", 15, ink);
+        bold(notesTitle);
+        panel.addView(notesTitle, MATCH_PARENT, WRAP_CONTENT);
+        gap(panel, 8);
+        ScrollView scroll = sheetScroll(.33f);
+        if (release.notes.isEmpty()) {
+            scroll.addView(text("该版本未提供更新说明", 14, muted), MATCH_PARENT, WRAP_CONTENT);
+        } else {
+            MarkdownReply notes = new MarkdownReply(context, ink, muted, blue, surface, edge, tint,
+                dark, .88f, services::open, this::copy, ignored -> {});
+            notes.setMarkdown(release.notes);
+            scroll.addView(notes, MATCH_PARENT, WRAP_CONTENT);
+        }
+        panel.addView(scroll, MATCH_PARENT, WRAP_CONTENT);
+        gap(panel, 12);
+        LinearLayout actions = horizontal();
+        TextView later = action("稍后", dialog::dismiss);
+        later.setTextColor(ink);
+        buttonBackground(later, surface, edge, 12);
+        actions.addView(later, new LinearLayout.LayoutParams(0, dp(46), 1));
+        TextView download = action("下载更新", () -> {
             dialog.dismiss();
-            services.open(AppUpdate.download(tag, !mirror));
+            services.open(AppUpdate.download(release.tag, AppUpdate.preferMirror(java.util.Locale.getDefault())));
         });
-        panel.addView(alternate, MATCH_PARENT, WRAP_CONTENT);
-        sheetActions(panel, "稍后", dialog::dismiss, mirror ? "镜像下载" : "下载 APK", () -> {
-            dialog.dismiss();
-            services.open(AppUpdate.download(tag, mirror));
-        });
-        showSheet(dialog, panel);
+        download.setTextColor(dark ? 0xff0f1725 : 0xffffffff);
+        buttonBackground(download, blueSolid, 0, 12);
+        LinearLayout.LayoutParams downloadSize = new LinearLayout.LayoutParams(0, dp(46), 1);
+        downloadSize.setMarginStart(dp(8));
+        actions.addView(download, downloadSize);
+        panel.addView(actions, MATCH_PARENT, WRAP_CONTENT);
+        showPanel(dialog, panel, false);
     }
 
     private void buildModelSettings() {
@@ -1988,7 +2146,7 @@ final class NativeChat {
         modelChoice(style, "回复语气", "tone",
             new String[]{"默认", "亲切", "共情", "专业", "直接", "轻松幽默"},
             new String[]{"", "friendly", "empathetic", "professional", "direct", "playful"});
-        modelText(style, "自定义指令", "instructions", "可填写希望模型长期遵循的语言、语气或回复规则。",
+        modelText(style, "自定义指令", "instructions", "可填写希望模型长期遵循的语言、语气或回复规则。填写后会替换 DeepSeek 的默认提示词。",
             "例如：用简体中文回答，先给结论", 4000);
 
         LinearLayout output = settingsGroup(body, "输出与推理");
@@ -1998,7 +2156,7 @@ final class NativeChat {
             modelChoice(output, "长度字段", "tokenField",
                 new String[]{"max_completion_tokens", "max_tokens（兼容旧接口）"}, new String[]{"", "legacy"});
             modelChoice(output, "推理强度", "reasoning_effort",
-                new String[]{"默认", "关闭", "最少", "低", "中", "高", "很高", "最高"},
+                new String[]{"默认", "关闭", "最少", "Low", "中", "High", "很高", "Max"},
                 new String[]{"", "none", "minimal", "low", "medium", "high", "xhigh", "max"});
             modelChoice(output, "回复详略", "verbosity", new String[]{"默认", "简短", "适中", "详细"},
                 new String[]{"", "low", "medium", "high"});
@@ -2012,14 +2170,15 @@ final class NativeChat {
                 });
         } else {
             modelChoice(output, "推理强度", "reasoning_effort",
-                new String[]{"默认", "低", "高", "最高"}, new String[]{"", "low", "high", "max"});
-            settingsNote(body, "推理强度在聊天里打开「深度思考」后生效。当前官方聊天接口由服务端决定温度、Top-P 和停止序列。");
+                new String[]{"默认", "Low", "High", "Max"}, new String[]{"", "low", "high", "max"});
+            settingsNote(body, "推理强度在聊天里打开「深度思考」后生效。");
         }
 
+        LinearLayout sampling = settingsGroup(body, "采样");
+        modelNumber(sampling, "温度", "temperature", custom
+            ? "温度与 Top-P 通常只需调整其中一项。DeepSeek Chat 默认 1.0，DeepSeek-R1 默认 0.6。"
+            : "默认 1.0。温度设置在关闭「深度思考」时生效。", 0, 2, false);
         if (custom) {
-            LinearLayout sampling = settingsGroup(body, "采样");
-            modelNumber(sampling, "温度", "temperature", "数值越高，回复变化通常越多。温度与 Top-P 通常只需调整其中一项。",
-                0, 2, false);
             modelNumber(sampling, "Top-P", "top_p", "控制采样时考虑的候选词范围。",
                 0, 1, false);
             modelNumber(sampling, "频率惩罚", "frequency_penalty", "正值减少重复用词，负值更容许重复。",
@@ -2343,6 +2502,116 @@ final class NativeChat {
         }
     }
 
+    private void showProxyProviders() {
+        Dialog dialog = newSheet();
+        LinearLayout panel = settingsSheet(dialog, "SOCKS5 代理");
+        LinearLayout providers = settingsGroup(panel, "模型提供商");
+        for (ApiProvider provider : ApiProvider.values()) {
+            if (provider != ApiProvider.DEEPSEEK) divider(providers);
+            settingsRow(providers, R.drawable.ic_server, state.providerName(provider),
+                services.proxyEnabled(provider) ? "已启用" : "已关闭", () -> {
+                    dialog.dismiss();
+                    showProviderProxy(provider);
+                });
+        }
+        showSheet(dialog, panel);
+    }
+
+    private void showProviderProxy(ApiProvider provider) {
+        Dialog dialog = newSheet();
+        LinearLayout panel = settingsSheet(dialog, state.providerName(provider) + " · SOCKS5");
+        Switch enabled = new Switch(context);
+        enabled.setText("为此提供商启用代理");
+        enabled.setTextColor(ink);
+        enabled.setChecked(services.proxyEnabled(provider));
+        panel.addView(enabled, MATCH_PARENT, dp(48));
+
+        ScrollView scroll = sheetScroll(.55f);
+        LinearLayout form = vertical();
+        scroll.addView(form, MATCH_PARENT, WRAP_CONTENT);
+        panel.addView(scroll, MATCH_PARENT, WRAP_CONTENT);
+        label(form, "代理地址");
+        EditText proxyAddress = field("域名或 IP 地址", false);
+        proxyAddress.setSingleLine();
+        proxyAddress.setText(services.proxyHost(provider));
+        form.addView(proxyAddress, MATCH_PARENT, WRAP_CONTENT);
+        label(form, "端口");
+        EditText proxyPort = field("1080", false);
+        proxyPort.setInputType(InputType.TYPE_CLASS_NUMBER);
+        proxyPort.setSingleLine();
+        proxyPort.setText(Integer.toString(services.proxyPort(provider)));
+        form.addView(proxyPort, MATCH_PARENT, WRAP_CONTENT);
+        label(form, "用户名");
+        EditText username = field("无认证时留空", false);
+        username.setSingleLine();
+        username.setSaveEnabled(false);
+        form.addView(username, MATCH_PARENT, WRAP_CONTENT);
+        label(form, "密码");
+        EditText password = field("无认证时留空", true);
+        password.setSingleLine();
+        password.setSaveEnabled(false);
+        form.addView(password, MATCH_PARENT, WRAP_CONTENT);
+        try {
+            java.net.PasswordAuthentication saved = services.proxyCredentials(provider);
+            if (saved != null) {
+                username.setText(saved.getUserName());
+                password.setText(new String(saved.getPassword()));
+            }
+        } catch (Exception ignored) {
+            settingsNote(form, "无法读取已保存的 SOCKS5 凭据，请重新输入");
+        }
+        EditText[] fields = {proxyAddress, proxyPort, username, password};
+        for (EditText input : fields) input.setEnabled(enabled.isChecked());
+        enabled.setOnCheckedChangeListener((view, checked) -> {
+            for (EditText input : fields) input.setEnabled(checked);
+        });
+        sheetActions(panel, "取消", dialog::dismiss, "保存", () -> {
+            if (!enabled.isChecked()) {
+                services.disableProxy(provider);
+                dialog.dismiss();
+                return;
+            }
+            String host = proxyAddress.getText().toString().trim();
+            if (host.indexOf(':') >= 0 && !host.startsWith("[")) host = "[" + host + "]";
+            try {
+                java.net.URI address = new java.net.URI("socks://" + host);
+                if (address.getHost() == null || !host.equals(address.getHost())) throw new IllegalArgumentException();
+            } catch (java.net.URISyntaxException | IllegalArgumentException error) {
+                proxyAddress.setError("请输入域名或 IP 地址");
+                return;
+            }
+            int port;
+            try {
+                port = Integer.parseInt(proxyPort.getText().toString().trim());
+                if (port < 1 || port > 65535) throw new NumberFormatException();
+            } catch (NumberFormatException error) {
+                proxyPort.setError("请输入 1 到 65535 的端口");
+                return;
+            }
+            String user = username.getText().toString();
+            String secret = password.getText().toString();
+            if (user.isEmpty() != secret.isEmpty()) {
+                (user.isEmpty() ? username : password).setError("认证需要同时填写用户名和密码");
+                return;
+            }
+            java.nio.charset.CharsetEncoder encoder = java.nio.charset.StandardCharsets.ISO_8859_1.newEncoder();
+            if (user.length() > 255 || !encoder.canEncode(user)) {
+                username.setError("请输入最多 255 个拉丁字符");
+                return;
+            }
+            if (secret.length() > 255 || !encoder.canEncode(secret)) {
+                password.setError("请输入最多 255 个拉丁字符");
+                return;
+            }
+            if (!services.saveProxy(provider, host, port, user, secret)) {
+                toast("无法保存 SOCKS5 设置");
+                return;
+            }
+            dialog.dismiss();
+        });
+        showSheet(dialog, panel);
+    }
+
     private void buildApiSettings() {
         header("API 设置", R.drawable.ic_back, "返回", this::back, false);
         ScrollView scroll = new ScrollView(context);
@@ -2623,7 +2892,7 @@ final class NativeChat {
             }
             else {
                 modelsStatus = "正在读取上游模型…";
-                services.discoverModels(modelLookupId, endpoint, candidate);
+                services.discoverModels(modelLookupId, providerDraft, endpoint, candidate);
             }
         }
         showModelLookupState();
@@ -2704,7 +2973,7 @@ final class NativeChat {
         pendingProviderName = providerDraft == ApiProvider.CUSTOM ? providerNameDraft : "";
         keyStatus = test ? "正在测试连接…" : "正在保存…";
         updateKeyFeedback();
-        services.verify(endpoint, model, candidate, test);
+        services.verify(providerDraft, endpoint, model, candidate, test);
     }
 
     private void choicePopup(View anchor, ImageView arrow, String[] choices, int current, java.util.function.IntConsumer selected) {
@@ -2798,7 +3067,7 @@ final class NativeChat {
                 state.receive(chunk);
                 if (!hadReasoning && active.hasReasoning) unfolded.add(active.reply);
                 if (screen == CHAT && chunk != null && "message_delta".equals(chunk.optString("type"))) updateChatHeader();
-                if (state.job == null) finish("");
+                if (state.job == null) finish(active, "");
                 else if (screen == CHAT && !renderPending) {
                     renderPending = true;
                     messages.postDelayed(() -> {
@@ -2811,7 +3080,7 @@ final class NativeChat {
                 break;
             case "streamEnd":
                 if (state.job != null && state.job.id == event.optInt("id")) {
-                    finish(state.job.receivedFinish ? "" : event.optString("error", "连接中断，可以重新生成。"));
+                    finish(state.job, state.job.receivedFinish ? "" : event.optString("error", "连接中断，可以重新生成。"));
                 }
                 break;
             case "key": {

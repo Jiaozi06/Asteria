@@ -13,8 +13,20 @@ final class DeepSeek {
     private static final String ORIGIN = ApiProvider.DEEPSEEK.address;
 
     static final class Request {
+        private final Proxy proxy;
+        private final SocksAuthentication authentication;
+        private final boolean credentialsUnavailable;
+        RequestLog.Entry trace;
         private volatile HttpURLConnection connection;
         private volatile boolean cancelled;
+
+        Request(Proxy proxy, PasswordAuthentication credentials, boolean credentialsUnavailable) {
+            this.proxy = proxy;
+            this.authentication = credentials == null ? null : new SocksAuthentication(proxy, credentials);
+            this.credentialsUnavailable = credentialsUnavailable;
+        }
+
+        boolean cancelled() { return cancelled; }
 
         void cancel() {
             cancelled = true;
@@ -32,7 +44,10 @@ final class DeepSeek {
         }
 
         private HttpURLConnection connect(String target, String method, String key) throws IOException {
-            HttpURLConnection active = (HttpURLConnection) new URL(target).openConnection();
+            if (credentialsUnavailable) throw new ApiError("无法读取 SOCKS5 凭据，请在设置中重新保存");
+            if (authentication != null) authentication.enter();
+            URL url = new URL(target);
+            HttpURLConnection active = (HttpURLConnection) (proxy == null ? url.openConnection() : url.openConnection(proxy));
             connection = active;
             if (cancelled) {
                 active.disconnect();
@@ -42,11 +57,14 @@ final class DeepSeek {
             active.setConnectTimeout(20_000);
             active.setReadTimeout(250_000);
             active.setInstanceFollowRedirects(false);
+            // A shared connection must never carry another provider's SOCKS session.
+            if (proxy != null) active.setRequestProperty("Connection", "close");
             if (!key.isEmpty()) active.setRequestProperty("Authorization", "Bearer " + key);
             return active;
         }
 
         void close() {
+            if (authentication != null) authentication.leave();
             HttpURLConnection active = connection;
             if (active != null) active.disconnect();
         }
@@ -67,7 +85,12 @@ final class DeepSeek {
     }
 
     static InputStream checkedBody(HttpURLConnection connection) throws IOException {
+        return checkedBody(connection, null);
+    }
+
+    private static InputStream checkedBody(HttpURLConnection connection, RequestLog.Entry trace) throws IOException {
         int status = connection.getResponseCode();
+        if (trace != null) trace.status(status);
         if (status >= 200 && status < 300) return connection.getInputStream();
         String message;
         boolean contextLimit = false;
@@ -169,25 +192,29 @@ final class DeepSeek {
             connection.setRequestProperty("anthropic-beta", "files-api-2025-04-14");
         }
         connection.setRequestProperty("Accept", "text/event-stream");
+        RequestLog.Entry trace = request.trace;
+        if (trace != null) trace.request(connection.getURL().toExternalForm(), body, key);
         jsonBody(connection, body);
-        try (InputStream input = checkedBody(connection)) {
+        try (InputStream input = checkedBody(connection, trace)) {
             String type = connection.getContentType();
             if (!official && type != null && type.toLowerCase(Locale.ROOT).contains("application/json")) {
-                deliver(new JSONObject(new String(read(input, 16 * 1024 * 1024), StandardCharsets.UTF_8)), listener);
+                String data = new String(read(input, 16 * 1024 * 1024), StandardCharsets.UTF_8);
+                if (trace != null) trace.response(data, key);
+                deliver(new JSONObject(data), listener);
                 listener.accept(new JSONObject().put("type", "openai_done"));
                 return;
             }
-            events(input, listener);
+            events(input, listener, trace, key);
         }
     }
 
-    private static void events(InputStream input, Consumer<JSONObject> listener) throws Exception {
+    private static void events(InputStream input, Consumer<JSONObject> listener, RequestLog.Entry trace, String key) throws Exception {
         try (BufferedReader reader = new BufferedReader(new InputStreamReader(input, StandardCharsets.UTF_8))) {
             StringBuilder eventData = new StringBuilder();
             String line;
             while ((line = reader.readLine()) != null) {
                 if (line.isEmpty() && eventData.length() > 0) {
-                    if (dispatch(eventData.toString(), listener)) return;
+                    if (dispatch(eventData.toString(), listener, trace, key)) return;
                     eventData.setLength(0);
                 } else if (line.startsWith("data:")) {
                     if (eventData.length() > 0) eventData.append('\n');
@@ -195,11 +222,12 @@ final class DeepSeek {
                     eventData.append(value.startsWith(" ") ? value.substring(1) : value);
                 }
             }
-            if (eventData.length() > 0) dispatch(eventData.toString(), listener);
+            if (eventData.length() > 0) dispatch(eventData.toString(), listener, trace, key);
         }
     }
 
-    private static boolean dispatch(String data, Consumer<JSONObject> listener) throws Exception {
+    private static boolean dispatch(String data, Consumer<JSONObject> listener, RequestLog.Entry trace, String key) throws Exception {
+        if (trace != null) trace.response("data: " + data, key);
         JSONObject event = "[DONE]".equals(data.trim()) ? new JSONObject().put("type", "openai_done") : new JSONObject(data);
         deliver(event, listener);
         String type = event.optString("type");

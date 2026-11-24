@@ -25,6 +25,7 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.util.Locale;
+import java.util.Optional;
 import java.util.List;
 import java.util.Map;
 import java.util.Arrays;
@@ -44,6 +45,7 @@ public final class MainActivity extends Activity {
     private KeyVault vault;
     private AtomicFile stateFile;
     private final Services services = new Services();
+    private final RequestLog requestLog = new RequestLog();
     private Recording recording;
     private String pendingUploadKey = "";
     private SpeechRecognizer dictation;
@@ -154,18 +156,61 @@ public final class MainActivity extends Activity {
         return key;
     }
 
+    private DeepSeek.Request apiRequest(ApiProvider provider) {
+        SharedPreferences settings = getPreferences(MODE_PRIVATE);
+        if (!settings.getBoolean("socksEnabled_" + provider.name(), false)) return new DeepSeek.Request(null, null, false);
+        Proxy proxy = new Proxy(Proxy.Type.SOCKS, InetSocketAddress.createUnresolved(
+            settings.getString("socksHost_" + provider.name(), ""), settings.getInt("socksPort_" + provider.name(), 1080)));
+        try {
+            return new DeepSeek.Request(proxy, services.proxyCredentials(provider), false);
+        } catch (Exception error) {
+            return new DeepSeek.Request(proxy, null, true);
+        }
+    }
+
     final class Services {
+        boolean proxyEnabled(ApiProvider provider) {
+            return getPreferences(MODE_PRIVATE).getBoolean("socksEnabled_" + provider.name(), false);
+        }
+
+        String proxyHost(ApiProvider provider) {
+            return getPreferences(MODE_PRIVATE).getString("socksHost_" + provider.name(), "");
+        }
+
+        int proxyPort(ApiProvider provider) {
+            return getPreferences(MODE_PRIVATE).getInt("socksPort_" + provider.name(), 1080);
+        }
+
+        PasswordAuthentication proxyCredentials(ApiProvider provider) throws Exception {
+            return vault.openProxyCredentials(getPreferences(MODE_PRIVATE).getString("socksCredentials_" + provider.name(), ""));
+        }
+
+        void disableProxy(ApiProvider provider) {
+            getPreferences(MODE_PRIVATE).edit().putBoolean("socksEnabled_" + provider.name(), false).apply();
+        }
+
+        boolean saveProxy(ApiProvider provider, String host, int port, String username, String password) {
+            try {
+                String credentials = vault.sealProxyCredentials(username, password);
+                return getPreferences(MODE_PRIVATE).edit().putBoolean("socksEnabled_" + provider.name(), true)
+                    .putString("socksHost_" + provider.name(), host).putInt("socksPort_" + provider.name(), port)
+                    .putString("socksCredentials_" + provider.name(), credentials).commit();
+            } catch (Exception error) {
+                return false;
+            }
+        }
+
         void checkUpdate(boolean manual) {
             manualUpdate |= manual;
             if (checkingUpdate) return;
             checkingUpdate = true;
             worker.execute(() -> {
-                String tag = null;
+                Optional<AppUpdate.Release> update = null;
                 try {
                     String installed = getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
-                    tag = AppUpdate.check(installed, AppUpdate.preferMirror(Locale.getDefault()));
+                    update = AppUpdate.check(installed, AppUpdate.preferMirror(Locale.getDefault()));
                 } catch (Exception ignored) { }
-                String result = tag;
+                Optional<AppUpdate.Release> result = update;
                 runOnUiThread(() -> {
                     checkingUpdate = false;
                     boolean requested = manualUpdate;
@@ -219,9 +264,9 @@ public final class MainActivity extends Activity {
             catch (Exception error) { return "无法移除已保存的密钥"; }
         }
 
-        void discoverModels(int id, String endpoint, String candidate) {
+        void discoverModels(int id, ApiProvider provider, String endpoint, String candidate) {
             worker.execute(() -> {
-                DeepSeek.Request request = new DeepSeek.Request();
+                DeepSeek.Request request = apiRequest(provider);
                 try {
                     String key = candidate.isEmpty() ? vault.read(endpoint) : candidate;
                     HttpURLConnection connection = endpoint.isEmpty() ? request.open("/models", "GET", key)
@@ -244,9 +289,9 @@ public final class MainActivity extends Activity {
             });
         }
 
-        void verify(String endpoint, String model, String candidate, boolean test) {
+        void verify(ApiProvider provider, String endpoint, String model, String candidate, boolean test) {
             worker.execute(() -> {
-                DeepSeek.Request request = new DeepSeek.Request();
+                DeepSeek.Request request = apiRequest(provider);
                 String key = candidate.isEmpty() ? vault.read(endpoint) : candidate;
                 try {
                     if (ApiProvider.requiresKey(endpoint) && key.isEmpty()) throw new DeepSeek.ApiError("请先填写 API Key。");
@@ -272,8 +317,21 @@ public final class MainActivity extends Activity {
             });
         }
 
-        void stream(int id, String endpoint, String body, boolean compactContext, String attachmentKey) {
-            DeepSeek.Request request = new DeepSeek.Request();
+        boolean requestLoggingEnabled() {
+            return getPreferences(MODE_PRIVATE).getBoolean("requestLoggingEnabled", false);
+        }
+
+        void setRequestLoggingEnabled(boolean enabled) {
+            getPreferences(MODE_PRIVATE).edit().putBoolean("requestLoggingEnabled", enabled).apply();
+            if (!enabled) requestLog.clear();
+        }
+
+        List<RequestLog.Entry> requestLogs(String chatId) { return requestLog.forChat(chatId); }
+
+        void stream(int id, String chatId, ApiProvider provider, String endpoint, String body, boolean compactContext, String attachmentKey) {
+            DeepSeek.Request request = apiRequest(provider);
+            RequestLog.Entry trace = requestLoggingEnabled() ? requestLog.start(chatId, provider.label) : null;
+            request.trace = trace;
             streams.put(id, request);
             worker.execute(() -> {
                 String key = "";
@@ -286,9 +344,11 @@ public final class MainActivity extends Activity {
                     }
                     if (ApiProvider.requiresKey(endpoint) && key.isEmpty()) throw new DeepSeek.ApiError("请先配置当前接口的 API Key。");
                     DeepSeek.stream(request, endpoint, key, body, compactContext, event -> emit("stream", json("id", id, "event", event)));
+                    if (trace != null) trace.finish(request.cancelled(), "", key);
                     emit("streamEnd", json("id", id));
                 } catch (Exception e) {
                     String message = failure(e);
+                    if (trace != null) trace.finish(request.cancelled(), message, key);
                     emit("streamEnd", json("id", id, "error", key.isEmpty() ? message : message.replace(key, "••••")));
                 } finally {
                     request.close();
@@ -374,7 +434,7 @@ public final class MainActivity extends Activity {
     }
 
     private void upload(Uri uri, String keyId) {
-        DeepSeek.Request request = new DeepSeek.Request();
+        DeepSeek.Request request = apiRequest(ApiProvider.DEEPSEEK);
         String key = "";
         try {
             String name = "attachment";
@@ -508,7 +568,7 @@ public final class MainActivity extends Activity {
     }
 
     private void transcribe(Recording session) {
-        DeepSeek.Request request = new DeepSeek.Request();
+        DeepSeek.Request request = apiRequest(ApiProvider.DEEPSEEK);
         try {
             byte[] pcm = session.capture(level -> runOnUiThread(() -> {
                 if (recording == session && session.active && !isDestroyed()) screen.updateVoiceLevel((float) level);

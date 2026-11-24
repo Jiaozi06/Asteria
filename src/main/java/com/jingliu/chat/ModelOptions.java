@@ -1,10 +1,13 @@
 package com.jingliu.chat;
 
+import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Locale;
 import java.util.Set;
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -16,6 +19,8 @@ import static com.jingliu.chat.MainActivity.json;
 
 final class ModelOptions {
     private static final String FIELD = "modelOptions";
+    private static final DateTimeFormatter PROMPT_DATE =
+        DateTimeFormatter.ofPattern("uuuu年M月d日，EEEE", Locale.SIMPLIFIED_CHINESE);
     private static final String[] COMPATIBLE_FIELDS = {
         "temperature", "top_p", "frequency_penalty", "presence_penalty", "seed", "reasoning_effort", "verbosity", "stop"
     };
@@ -55,7 +60,20 @@ final class ModelOptions {
 
     static void apply(ChatState state, JSONObject chat, JSONObject request, boolean thinking) {
         JSONObject options = local(chat);
+        boolean compatible = state.custom();
+        String model = string(request, "model").toLowerCase(Locale.ROOT);
+        model = model.substring(model.lastIndexOf('/') + 1);
+        boolean r1 = model.matches("deepseek-r1(?:[-.:].*)?");
+        boolean deepSeekChat = !compatible || model.matches("deepseek-(?:chat|flash|v[34])(?:[-.:].*)?");
+        if ((compatible || !thinking) && options.isNull("temperature") && (r1 || deepSeekChat)) {
+            put(request, "temperature", r1 ? 0.6 : 1.0);
+        }
+
         List<String> instructions = new ArrayList<>();
+        String prompt = string(options, "instructions");
+        if (prompt.isEmpty() && deepSeekChat && !r1) {
+            instructions.add("该助手为DeepSeek Chat，由深度求索公司创造。今天是" + LocalDate.now().format(PROMPT_DATE) + "。");
+        }
         switch (string(options, "tone")) {
             case "friendly": instructions.add("Use a warm, friendly tone."); break;
             case "empathetic": instructions.add("Use an empathetic and considerate tone when appropriate."); break;
@@ -64,9 +82,8 @@ final class ModelOptions {
             case "playful": instructions.add("Use light, appropriate humor when it fits the topic."); break;
             default: break;
         }
-        String prompt = string(options, "instructions");
         if (!prompt.isEmpty()) instructions.add(prompt);
-        if (state.custom()) {
+        if (compatible) {
             for (String name : COMPATIBLE_FIELDS) copy(options, name, request, name);
             String tokenField = "legacy".equals(string(options, "tokenField")) ? "max_tokens" : "max_completion_tokens";
             copy(options, "outputLimit", request, tokenField);
@@ -89,6 +106,7 @@ final class ModelOptions {
                 put(request, "messages", messages);
             }
         } else {
+            if (!thinking) copy(options, "temperature", request, "temperature");
             copy(options, "outputLimit", request, "max_tokens");
             String effort = string(options, "reasoning_effort");
             if (thinking && !effort.isEmpty()) put(request, "output_config", json("effort", effort));

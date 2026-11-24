@@ -6,15 +6,26 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.Locale;
+import java.util.Optional;
 import java.util.regex.Pattern;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
 final class AppUpdate {
-    private static final String RELEASES = "https://github.com/Jiaozi06/Asteria/releases";
+    static final String PROJECT_URL = "https://github.com/Jiaozi06/Asteria";
+    static final String RELEASES_URL = PROJECT_URL + "/releases";
     private static final String LATEST = "https://api.github.com/repos/Jiaozi06/Asteria/releases/latest";
     private static final String MIRROR = "https://gh-proxy.com/";
     private static final Pattern VERSION = Pattern.compile("v?[0-9]{1,9}(?:\\.[0-9]{1,9}){1,3}");
+
+    static final class Release {
+        final String tag, notes;
+
+        Release(String tag, String notes) {
+            this.tag = tag;
+            this.notes = notes;
+        }
+    }
 
     private AppUpdate() {}
 
@@ -22,10 +33,10 @@ final class AppUpdate {
 
     static String download(String tag, boolean mirror) {
         if (!VERSION.matcher(tag).matches()) throw new IllegalArgumentException("Invalid release tag");
-        return (mirror ? MIRROR : "") + RELEASES + "/download/" + tag + "/Asteria.apk";
+        return (mirror ? MIRROR : "") + RELEASES_URL + "/download/" + tag + "/Asteria.apk";
     }
 
-    static String check(String installed, boolean mirrorFirst) throws Exception {
+    static Optional<Release> check(String installed, boolean mirrorFirst) throws Exception {
         try {
             return readRelease(installed, mirrorFirst);
         } catch (Exception firstFailure) {
@@ -33,7 +44,7 @@ final class AppUpdate {
         }
     }
 
-    private static String readRelease(String installed, boolean mirror) throws Exception {
+    private static Optional<Release> readRelease(String installed, boolean mirror) throws Exception {
         HttpURLConnection connection = (HttpURLConnection) new URL((mirror ? MIRROR : "") + LATEST).openConnection();
         try {
             connection.setConnectTimeout(4500);
@@ -49,17 +60,20 @@ final class AppUpdate {
         }
     }
 
-    static String newerRelease(String installed, JSONObject release) {
+    static Optional<Release> newerRelease(String installed, JSONObject release) {
         String tag = release.optString("tag_name");
-        if (release.optBoolean("draft") || release.optBoolean("prerelease") || compare(tag, installed) <= 0) return "";
+        if (release.optBoolean("draft") || release.optBoolean("prerelease") || compare(tag, installed) <= 0) return Optional.empty();
         JSONArray assets = release.optJSONArray("assets");
-        if (assets == null) return "";
+        if (assets == null) return Optional.empty();
         for (int i = 0; i < assets.length(); i++) {
             JSONObject asset = assets.optJSONObject(i);
             if (asset != null && "Asteria.apk".equals(asset.optString("name"))
-                    && download(tag, false).equals(asset.optString("browser_download_url"))) return tag;
+                    && download(tag, false).equals(asset.optString("browser_download_url"))) {
+                String notes = release.isNull("body") ? "" : release.optString("body").trim();
+                return Optional.of(new Release(tag, notes));
+            }
         }
-        return "";
+        return Optional.empty();
     }
 
     private static int compare(String tag, String installed) {
