@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">Asteria</string>
+    <color name="launcher_background">#202F4D</color>
+    <color name="launcher_star">#83AAFF</color>
+</resources>

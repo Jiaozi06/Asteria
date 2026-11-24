@@ -1,0 +1,25 @@
+<resources>
+    <style name="Jingliu.Light" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:colorAccent">#3268DF</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowBackground">#FFFFFF</item>
+        <item name="android:alertDialogTheme">@style/Jingliu.Dialog.Light</item>
+    </style>
+    <style name="Jingliu.Dark" parent="android:style/Theme.Material.NoActionBar">
+        <item name="android:colorAccent">#83AAFF</item>
+        <item name="android:windowBackground">#101216</item>
+        <item name="android:alertDialogTheme">@style/Jingliu.Dialog.Dark</item>
+    </style>
+    <style name="Jingliu.Dialog.Light" parent="android:style/Theme.Material.Light.Dialog.Alert">
+        <item name="android:colorAccent">#3268DF</item>
+        <item name="android:windowAnimationStyle">@style/Jingliu.PanelAnimation</item>
+    </style>
+    <style name="Jingliu.Dialog.Dark" parent="android:style/Theme.Material.Dialog.Alert">
+        <item name="android:colorAccent">#83AAFF</item>
+        <item name="android:windowAnimationStyle">@style/Jingliu.PanelAnimation</item>
+    </style>
+    <style name="Jingliu.PanelAnimation" parent="@android:style/Animation">
+        <item name="android:windowEnterAnimation">@anim/panel_enter</item>
+        <item name="android:windowExitAnimation">@anim/panel_exit</item>
+    </style>
+</resources>
