@@ -54,6 +54,7 @@ final class NativeChat {
     private final Set<JSONObject> unfolded = new HashSet<>();
     private final Map<String, ImageButton> speechButtons = new HashMap<>();
     private String speaking = "";
+    private String offeredUpdate = "";
     private Context context;
     private boolean dark, hasKey, upload, recording, transcribing, renderPending, checking;
     private boolean voiceMode, holdingVoice;
@@ -64,9 +65,10 @@ final class NativeChat {
     private String heldVoiceText = "";
     private String keyStatus = "", pendingUrl, pendingModel;
     private ApiProvider pendingProvider, providerDraft;
+    private String providerNameDraft, pendingProviderName, keyManagementEndpoint;
     private int screen;
     private JSONObject editedOptionsChat;
-    private static final int CHAT = 0, SETTINGS = 1, API_SETTINGS = 2, FONT_SETTINGS = 3, MODEL_SETTINGS = 4;
+    private static final int CHAT = 0, SETTINGS = 1, API_SETTINGS = 2, FONT_SETTINGS = 3, MODEL_SETTINGS = 4, KEY_SETTINGS = 5;
     private enum Motion { NONE, PUSH, POP, FADE }
     private static final PathInterpolator EASE = new PathInterpolator(.22f, .75f, .23f, 1f);
     private View screenView;
@@ -86,7 +88,7 @@ final class NativeChat {
     private View editShade;
     private EditSession editing;
     private ScrollView transcript;
-    private TextView welcome, chatTitle, chatModel, think, search, keyFeedback, verify, saveOnly, forget;
+    private TextView welcome, chatTitle, chatModel, think, search, keyFeedback, verify, saveOnly, manageKeys;
     private TextView voicePad;
     private FrameLayout voiceOverlay;
     private VoiceHalo voiceHalo;
@@ -94,7 +96,7 @@ final class NativeChat {
     private LinearLayout chatTitles;
     private ImageButton chatOptions;
     private ImageButton send, mic, add, returnBottom;
-    private EditText input, apiKey, apiUrl, apiModel;
+    private EditText input, apiKey, apiUrl, apiModel, providerName;
     private LinearLayout modelRow;
     private ImageButton modelArrow;
     private TextView modelsFeedback, refreshModels, providerRow, resetAddress;
@@ -203,6 +205,7 @@ final class NativeChat {
             screenView = drawer;
         } else {
             if (screen == API_SETTINGS) buildApiSettings();
+            else if (screen == KEY_SETTINGS) buildKeySettings();
             else if (screen == FONT_SETTINGS) buildFontSettings();
             else if (screen == MODEL_SETTINGS) buildModelSettings();
             else buildSettingsHome();
@@ -237,12 +240,19 @@ final class NativeChat {
     boolean back() {
         if (screen != CHAT) {
             services.hideKeyboard();
-            if (screen == FONT_SETTINGS || screen == MODEL_SETTINGS) {
-                if (screen == MODEL_SETTINGS && editedOptionsChat != null) {
-                    editedOptionsChat = null;
-                    returnToChat(false);
-                    return true;
-                }
+            if (screen == KEY_SETTINGS) {
+                screen = API_SETTINGS;
+                keyManagementEndpoint = null;
+                show(Motion.POP, false);
+                queueModelLookup();
+                return true;
+            }
+            if (screen == MODEL_SETTINGS) {
+                editedOptionsChat = null;
+                returnToChat(false);
+                return true;
+            }
+            if (screen == FONT_SETTINGS) {
                 screen = SETTINGS;
                 show(Motion.POP, false);
                 return true;
@@ -560,11 +570,9 @@ final class NativeChat {
     private void toggle(String option) {
         if (state.custom()) {
             if ("think".equals(option)) {
-                composerNotice("深度思考", "兼容接口的推理选项取决于上游模型。可在高级设置里调整「推理强度」。",
-                    "打开设置", () -> {
-                        if (state.current() != null) openChatOptions();
-                        else openSettingsHome();
-                    });
+                if (state.current() == null) {
+                    composerNotice("深度思考", "发送第一条消息后，可从对话顶部的齿轮调整推理强度。", "", null);
+                } else openChatOptions();
             } else {
                 composerNotice("智能搜索", "当前的联网搜索使用 DeepSeek 官方接口。", "API 设置", this::openApiSettings);
             }
@@ -761,7 +769,7 @@ final class NativeChat {
             voiceMode = false;
             upload = true;
             controls();
-            services.pickFile(index == 0);
+            services.pickFile(index == 0, state.attachmentKey());
         }).show();
     }
 
@@ -771,7 +779,7 @@ final class NativeChat {
         TextView note = text(explanation, 14, muted);
         pad(note, 6, 14);
         panel.addView(note, MATCH_PARENT, WRAP_CONTENT);
-        sheetActions(panel, "取消", dialog::dismiss, actionLabel, () -> {
+        if (open != null) sheetActions(panel, "取消", dialog::dismiss, actionLabel, () -> {
             dialog.dismiss();
             open.run();
         });
@@ -930,7 +938,8 @@ final class NativeChat {
         renderMessages(true);
         controls();
         if (drawer.isRevealed()) refreshHistory();
-        services.stream(job.id, job.endpoint, job.request.toString(), state.data.optBoolean("compactContext", true));
+        services.stream(job.id, job.endpoint, job.request.toString(), state.data.optBoolean("compactContext", true),
+            job.attachmentKey);
     }
     private void finish(String error) {
         state.finish(error);
@@ -1074,7 +1083,7 @@ final class NativeChat {
             renderLive(false);
             return;
         }
-        thinking.display(merged(message, "thinking", "thinking"), false);
+        thinking.display(hiddenReply(message) ? "" : merged(message, "thinking", "thinking"), false);
         entry.addView(thinking, MATCH_PARENT, WRAP_CONTENT);
         WebSources sources = WebSources.from(message);
         setSourceLink(sourceLink, sources);
@@ -1082,7 +1091,7 @@ final class NativeChat {
         String answer = answer(message);
         result.setMarkdown(sources.annotatedAnswer(message));
         entry.addView(result, MATCH_PARENT, WRAP_CONTENT);
-        setStatus(status, string(message, "status"));
+        setStatus(status, replyStatus(message));
         entry.addView(status);
         if (latest && state.job == null) {
             LinearLayout bar = horizontal();
@@ -1404,13 +1413,13 @@ final class NativeChat {
         WebSources sources = WebSources.from(liveReply);
         setSourceLink(liveSourceLink, sources);
         String text = sources.annotatedAnswer(liveReply);
-        String reasoning = merged(liveReply, "thinking", "thinking");
+        String reasoning = hiddenReply(liveReply) ? "" : merged(liveReply, "thinking", "thinking");
         if (!text.equals(liveText) || liveAnswer.getChildCount() == 0) {
             liveAnswer.setMarkdown(text, animate);
             liveText = text;
         }
         liveThinking.display(reasoning, state.job != null && !state.job.thinkingFinished, animate);
-        setStatus(liveStatus, string(liveReply, "status"));
+        setStatus(liveStatus, replyStatus(liveReply));
     }
 
     private void buildHistory() {
@@ -1852,6 +1861,7 @@ final class NativeChat {
         if (!apiFromSettings && !prepareSettingsFromChat()) return;
         screen = API_SETTINGS;
         providerDraft = state.apiProvider();
+        providerNameDraft = state.providerName(providerDraft);
         urlDraft = state.preferredAddress(providerDraft);
         modelDraft = state.preferredModel(providerDraft, state.endpoint());
         keyDraft = "";
@@ -1879,13 +1889,7 @@ final class NativeChat {
 
         LinearLayout connection = settingsGroup(body, "连接与数据");
         settingsRow(connection, R.drawable.ic_server, "API 设置",
-            state.apiProvider().label, this::openApiSettings);
-        divider(connection);
-        settingsRow(connection, R.drawable.ic_sliders, "高级设置", "", () -> {
-            editedOptionsChat = null;
-            screen = MODEL_SETTINGS;
-            show(Motion.PUSH, false);
-        });
+            state.providerName(state.apiProvider()), this::openApiSettings);
         divider(connection);
         settingsRow(connection, R.drawable.ic_manage, "管理对话", "", () -> {
             historyFilter = "";
@@ -1936,11 +1940,37 @@ final class NativeChat {
         } catch (PackageManager.NameNotFoundException ignored) {
         }
         settingsRow(about, R.drawable.ic_mark, "应用版本", version, null);
+        divider(about);
+        settingsRow(about, R.drawable.ic_continue, "检查更新", "", () -> {
+            toast("正在检查更新");
+            services.checkUpdate(true);
+        });
+    }
+
+    void updateAvailable(String tag, boolean requested) {
+        if (tag == null || tag.isEmpty()) {
+            if (requested) toast(tag == null ? "暂时无法检查更新" : "当前已是最新版本");
+            return;
+        }
+        if (!requested && tag.equals(offeredUpdate)) return;
+        offeredUpdate = tag;
+        Dialog dialog = newSheet();
+        LinearLayout panel = settingsSheet(dialog, "发现新版本 " + tag);
+        boolean mirror = AppUpdate.preferMirror(java.util.Locale.getDefault());
+        TextView alternate = action(mirror ? "GitHub 直连下载" : "镜像下载", () -> {
+            dialog.dismiss();
+            services.open(AppUpdate.download(tag, !mirror));
+        });
+        panel.addView(alternate, MATCH_PARENT, WRAP_CONTENT);
+        sheetActions(panel, "稍后", dialog::dismiss, mirror ? "镜像下载" : "下载 APK", () -> {
+            dialog.dismiss();
+            services.open(AppUpdate.download(tag, mirror));
+        });
+        showSheet(dialog, panel);
     }
 
     private void buildModelSettings() {
-        boolean conversation = editedOptionsChat != null;
-        header(conversation ? "对话高级设置" : "高级设置", R.drawable.ic_back, "返回", this::back, false);
+        header("对话高级设置", R.drawable.ic_back, "返回", this::back, false);
         ScrollView scroll = new ScrollView(context);
         layout.addView(scroll, new LinearLayout.LayoutParams(MATCH_PARENT, 0, 1));
         LinearLayout body = vertical();
@@ -1949,16 +1979,10 @@ final class NativeChat {
 
         boolean custom = state.custom();
         String model = state.effectiveModel();
-        String provider = custom ? state.apiProvider().label + " · " + (model.isEmpty() ? "尚未选择模型" : model)
+        String provider = custom ? state.providerName(state.apiProvider()) + " · " + (model.isEmpty() ? "尚未选择模型" : model)
             : "DeepSeek 官方 · Flash / V4 Pro";
-        if (conversation) {
-            settingsNote(body, string(editedOptionsChat, "title") + "\n" + provider
-                + "\n设置仅影响当前对话。未单独设置的选项沿用全局。");
-        } else {
-            settingsNote(body, provider + (custom
-                ? "\n设置按接口地址和模型保存，参数支持情况因上游而异。"
-                : "\n这些设置用于官方接口的两个模型。"));
-        }
+        settingsNote(body, string(editedOptionsChat, "title") + "\n" + provider
+            + "\n设置仅影响当前对话。未设置的参数使用接口默认值。");
 
         LinearLayout style = settingsGroup(body, "回复风格");
         modelChoice(style, "回复语气", "tone",
@@ -2026,17 +2050,15 @@ final class NativeChat {
         }
 
         gap(body, 12);
-        String resetTitle = conversation ? "恢复全局设置" : "恢复默认";
+        String resetTitle = "恢复默认";
         TextView reset = action(resetTitle, () -> {
             Dialog dialog = newSheet();
             LinearLayout panel = settingsSheet(dialog, resetTitle);
-            TextView note = text(conversation ? "清除这条对话的高级设置，让它继续沿用全局设置？"
-                : "清除当前接口的这组高级设置？", 14, muted);
+            TextView note = text("将这条对话的高级设置恢复为默认值？", 14, muted);
             pad(note, 6, 14);
             panel.addView(note, MATCH_PARENT, WRAP_CONTENT);
             sheetActions(panel, "取消", dialog::dismiss, "恢复", () -> {
-                if (conversation) ModelOptions.resetLocal(editedOptionsChat);
-                else ModelOptions.reset(state);
+                ModelOptions.resetLocal(editedOptionsChat);
                 save();
                 dialog.dismiss();
                 show(Motion.FADE, false);
@@ -2053,25 +2075,17 @@ final class NativeChat {
     }
 
     private JSONObject editedModelOptions() {
-        return editedOptionsChat == null ? ModelOptions.get(state) : ModelOptions.local(editedOptionsChat);
+        return ModelOptions.local(editedOptionsChat);
     }
 
     private void storeModelOption(String key, Object value) {
-        if (editedOptionsChat == null) ModelOptions.set(state, key, value);
-        else ModelOptions.setLocal(editedOptionsChat, key, value);
+        ModelOptions.setLocal(editedOptionsChat, key, value);
         save();
     }
 
     private void modelChoice(LinearLayout group, String title, String key, String[] labels, String[] values) {
-        boolean conversation = editedOptionsChat != null;
-        String[] choices = conversation ? new String[labels.length + 1] : labels;
-        if (conversation) {
-            choices[0] = "沿用全局";
-            System.arraycopy(labels, 0, choices, 1, labels.length);
-        }
         addModelOption(group, title, () -> {
             JSONObject options = editedModelOptions();
-            if (conversation && !options.has(key)) return choices[0];
             String stored = string(options, key);
             int index = Math.max(0, java.util.Arrays.asList(values).indexOf(stored));
             return labels[index];
@@ -2079,13 +2093,9 @@ final class NativeChat {
             JSONObject options = editedModelOptions();
             String current = string(options, key);
             int valueIndex = Math.max(0, java.util.Arrays.asList(values).indexOf(current));
-            int selected = conversation ? (options.has(key) ? valueIndex + 1 : 0) : valueIndex;
-            choiceSheet(title, choices, selected, choice -> {
-                if (conversation && choice == 0) storeModelOption(key, null);
-                else {
-                    String value = values[conversation ? choice - 1 : choice];
-                    storeModelOption(key, value.isEmpty() ? (conversation ? JSONObject.NULL : null) : value);
-                }
+            choiceSheet(title, labels, valueIndex, choice -> {
+                String value = values[choice];
+                storeModelOption(key, value.isEmpty() ? null : value);
                 update.run();
             });
         });
@@ -2117,10 +2127,9 @@ final class NativeChat {
             java.util.function.Function<String, Object> parse) {
         addModelOption(group, title, () -> {
             Object value = editedModelOptions().opt(key);
-            if (value == null) return editedOptionsChat == null ? "默认" : "沿用全局";
-            return value == JSONObject.NULL ? "默认" : value instanceof Number ? value.toString() : "已设置";
+            if (value == null || value == JSONObject.NULL) return "默认";
+            return value instanceof Number ? value.toString() : "已设置";
         }, update -> {
-            boolean conversation = editedOptionsChat != null;
             JSONObject options = editedModelOptions();
             Object value = options.opt(key);
             String initial = options.isNull(key) ? "" : value.toString();
@@ -2137,7 +2146,7 @@ final class NativeChat {
             LinearLayout content = vertical();
             pad(content, 6, 12);
             scroll.addView(content, MATCH_PARENT, WRAP_CONTENT);
-            TextView explanation = text(conversation ? help + "\n留空保存使用接口默认值，或点「沿用全局」。" : help, 14, muted);
+            TextView explanation = text(help, 14, muted);
             content.addView(explanation, MATCH_PARENT, WRAP_CONTENT);
             gap(content, 8);
             EditText editor = field(hint, false);
@@ -2153,7 +2162,7 @@ final class NativeChat {
             editor.setText(initial);
             editor.setSelection(editor.length());
             content.addView(editor, MATCH_PARENT, WRAP_CONTENT);
-            sheetActions(panel, conversation ? "沿用全局" : "恢复默认", () -> {
+            sheetActions(panel, "恢复默认", () -> {
                 storeModelOption(key, null);
                 dialog.dismiss();
                 update.run();
@@ -2162,7 +2171,7 @@ final class NativeChat {
                 try {
                     String raw = "stop".equals(key) ? entered : entered.trim();
                     Object result = raw.trim().isEmpty() ? null : parse.apply(raw);
-                    storeModelOption(key, conversation && result == null ? JSONObject.NULL : result);
+                    storeModelOption(key, result);
                     dialog.dismiss();
                     update.run();
                 } catch (NumberFormatException error) {
@@ -2342,7 +2351,7 @@ final class NativeChat {
         pad(form, 18, 9);
         scroll.addView(form, MATCH_PARENT, WRAP_CONTENT);
         label(form, "模型提供商");
-        providerRow = action("", () -> choiceSheet("模型提供商", new String[]{"DeepSeek", "OpenAI"},
+        providerRow = action("", () -> choiceSheet("模型提供商", new String[]{"DeepSeek", "OpenAI", "自定义提供商"},
             providerDraft.ordinal(), selected -> selectApiProvider(ApiProvider.values()[selected])));
         providerRow.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
         providerRow.setTextSize(15);
@@ -2352,16 +2361,27 @@ final class NativeChat {
         pad(providerRow, 14, 0);
         buttonBackground(providerRow, surface, edge, 14);
         form.addView(providerRow, MATCH_PARENT, dp(52));
+        providerName = null;
+        if (providerDraft == ApiProvider.CUSTOM) {
+            label(form, "提供商名称");
+            providerName = field("例如：我的模型服务", false);
+            providerName.setContentDescription("提供商名称");
+            if (!providerDraft.label.equals(providerNameDraft)) providerName.setText(providerNameDraft);
+            form.addView(providerName, MATCH_PARENT, WRAP_CONTENT);
+        }
 
         label(form, "API 接口");
-        apiUrl = field(providerDraft.address, false);
+        apiUrl = field(providerDraft.address.isEmpty() ? "https://example.com/v1" : providerDraft.address, false);
         apiUrl.setContentDescription("API 接口");
         apiUrl.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
         apiUrl.setText(urlDraft);
         form.addView(apiUrl, MATCH_PARENT, WRAP_CONTENT);
-        resetAddress = action("恢复官方地址", () -> apiUrl.setText(providerDraft.address));
-        resetAddress.setTextSize(12);
-        form.addView(resetAddress, WRAP_CONTENT, WRAP_CONTENT);
+        resetAddress = null;
+        if (!providerDraft.address.isEmpty()) {
+            resetAddress = action("恢复官方地址", () -> apiUrl.setText(providerDraft.address));
+            resetAddress.setTextSize(12);
+            form.addView(resetAddress, WRAP_CONTENT, WRAP_CONTENT);
+        }
 
         label(form, "密钥");
         apiKey = field("输入 API Key", true);
@@ -2371,7 +2391,12 @@ final class NativeChat {
         form.addView(apiKey, MATCH_PARENT, WRAP_CONTENT);
         keyFeedback = text("", 13, muted);
         pad(keyFeedback, 2, 6);
-        form.addView(keyFeedback, MATCH_PARENT, WRAP_CONTENT);
+        LinearLayout keyInfo = horizontal();
+        keyInfo.addView(keyFeedback, new LinearLayout.LayoutParams(0, WRAP_CONTENT, 1));
+        manageKeys = action("密钥管理", this::openKeySettings);
+        manageKeys.setTextSize(13);
+        keyInfo.addView(manageKeys, WRAP_CONTENT, WRAP_CONTENT);
+        form.addView(keyInfo, MATCH_PARENT, WRAP_CONTENT);
 
         label(form, "模型");
         apiModel = field("选择上游模型或输入模型 ID", false);
@@ -2402,14 +2427,13 @@ final class NativeChat {
         actions.addView(verify);
         saveOnly = action("直接保存", () -> saveKey(false));
         actions.addView(saveOnly);
-        forget = action("移除密钥", this::forgetKey);
-        forget.setTextSize(12);
-        actions.addView(forget);
 
         gap(form, 12);
-        TextView link = action("打开 " + providerDraft.label + " 密钥管理  ↗", () -> services.open(providerDraft.keyPage));
-        link.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
-        form.addView(link, MATCH_PARENT, WRAP_CONTENT);
+        if (!providerDraft.keyPage.isEmpty()) {
+            TextView link = action("打开 " + providerDraft.label + " 密钥管理  ↗", () -> services.open(providerDraft.keyPage));
+            link.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
+            form.addView(link, MATCH_PARENT, WRAP_CONTENT);
+        }
         gap(form, 14);
         updateKeyFeedback();
         showModelLookupState();
@@ -2428,10 +2452,122 @@ final class NativeChat {
         watch(apiKey, value -> queueModelLookup());
     }
 
+    private void openKeySettings() {
+        String endpoint = editingEndpoint();
+        if (endpoint == null || checking) return;
+        services.hideKeyboard();
+        captureEndpointFields();
+        keyDraft = apiKey.getText().toString();
+        keyManagementEndpoint = endpoint;
+        screen = KEY_SETTINGS;
+        stopModelLookup();
+        show(Motion.PUSH, false);
+    }
+
+    private void buildKeySettings() {
+        header("密钥管理", R.drawable.ic_back, "返回", this::back, false);
+        ScrollView scroll = new ScrollView(context);
+        layout.addView(scroll, new LinearLayout.LayoutParams(MATCH_PARENT, 0, 1));
+        LinearLayout body = vertical();
+        pad(body, 16, 10);
+        scroll.addView(body, MATCH_PARENT, WRAP_CONTENT);
+        String endpoint = keyManagementEndpoint;
+        settingsNote(body, endpoint.isEmpty() ? ApiProvider.DEEPSEEK.address : endpoint);
+
+        LinearLayout strategy = settingsGroup(body, "使用策略");
+        KeyVault.Mode mode = services.keyMode(endpoint);
+        settingsRow(strategy, R.drawable.ic_sliders, "密钥选择", mode.label, () ->
+            choiceSheet("密钥选择", new String[]{"轮询", "随机"}, mode.ordinal(), index -> {
+                if (services.setKeyMode(endpoint, KeyVault.Mode.values()[index])) show(Motion.NONE, false);
+                else toast("无法保存密钥选择方式");
+            }));
+        divider(strategy);
+        int visible = services.keyVisibleLength(endpoint);
+        settingsRow(strategy, R.drawable.ic_key, "首尾显示位数", "各 " + visible + " 位", () -> {
+            String[] values = new String[8];
+            for (int i = 0; i < values.length; i++) values[i] = "各 " + (i + 1) + " 位";
+            choiceSheet("首尾显示位数", values, visible - 1, index -> {
+                if (services.setKeyVisibleLength(endpoint, index + 1)) show(Motion.NONE, false);
+                else toast("无法保存脱敏设置");
+            });
+        });
+        settingsNote(body, "每条普通对话请求按策略选择一把密钥。含附件的对话沿用附件密钥。");
+
+        LinearLayout keys = settingsGroup(body, "已保存的密钥");
+        try {
+            for (KeyVault.Entry entry : services.savedKeys(endpoint)) {
+                if (keys.getChildCount() > 0) divider(keys);
+                LinearLayout row = settingsLine(keys, R.drawable.ic_key);
+                TextView display = text(entry.display, 15, ink);
+                display.setTypeface(Typeface.MONOSPACE);
+                display.setSingleLine();
+                display.setEllipsize(TextUtils.TruncateAt.MIDDLE);
+                pad(display, 11, 0);
+                row.addView(display, new LinearLayout.LayoutParams(0, MATCH_PARENT, 1));
+                ImageButton remove = icon(R.drawable.ic_trash, "移除密钥 " + entry.display,
+                    () -> confirmRemoveKey(endpoint, entry));
+                remove.setImageTintList(ColorStateList.valueOf(dangerColor()));
+                row.addView(remove, dp(44), dp(44));
+            }
+            if (keys.getChildCount() == 0) settingsNote(keys, "此接口还没有保存密钥");
+        } catch (Exception error) {
+            settingsNote(keys, "无法读取已保存的密钥");
+        }
+        gap(body, 12);
+        TextView addKey = action("添加密钥", () -> showAddKey(endpoint));
+        addKey.setTextColor(dark ? 0xff0f1725 : 0xffffffff);
+        buttonBackground(addKey, blueSolid, 0, 13);
+        body.addView(addKey, MATCH_PARENT, WRAP_CONTENT);
+    }
+
+    private void showAddKey(String endpoint) {
+        Dialog dialog = newSheet();
+        LinearLayout panel = settingsSheet(dialog, "添加密钥");
+        EditText value = field("输入 API Key", true);
+        value.setContentDescription("新密钥");
+        LinearLayout.LayoutParams spacing = new LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT);
+        spacing.topMargin = dp(10);
+        panel.addView(value, spacing);
+        sheetActions(panel, "取消", dialog::dismiss, "保存", () -> {
+            String key = value.getText().toString().trim();
+            if (key.isEmpty() || key.matches(".*\\s.*")) {
+                value.setError("请填写有效的 API Key");
+                return;
+            }
+            String error = services.addKey(endpoint, key);
+            if (!error.isEmpty()) {
+                value.setError(error);
+                return;
+            }
+            value.setText("");
+            dialog.dismiss();
+            updateKey();
+            show(Motion.NONE, false);
+        });
+        showSheet(dialog, panel);
+    }
+
+    private void confirmRemoveKey(String endpoint, KeyVault.Entry entry) {
+        if (!mayChange()) return;
+        Dialog dialog = newSheet();
+        LinearLayout panel = settingsSheet(dialog, "移除密钥？");
+        settingsNote(panel, entry.display);
+        sheetActions(panel, "取消", dialog::dismiss, "移除", () -> {
+            dialog.dismiss();
+            if (!mayChange()) return;
+            String error = services.removeKey(endpoint, entry.id);
+            if (!error.isEmpty()) toast(error);
+            updateKey();
+            show(Motion.NONE, false);
+        });
+        showSheet(dialog, panel);
+    }
+
     private void selectApiProvider(ApiProvider next) {
         if (checking || next == providerDraft) return;
         services.hideKeyboard();
         providerDraft = next;
+        providerNameDraft = state.providerName(next);
         urlDraft = state.preferredAddress(next);
         modelDraft = state.preferredModel(next, editingEndpoint());
         keyDraft = "";
@@ -2444,6 +2580,7 @@ final class NativeChat {
     private void captureEndpointFields() {
         if (apiUrl != null) urlDraft = apiUrl.getText().toString();
         if (apiModel != null) modelDraft = apiModel.getText().toString();
+        if (providerName != null) providerNameDraft = providerName.getText().toString().trim();
     }
 
     private String editingEndpoint() {
@@ -2529,13 +2666,16 @@ final class NativeChat {
         apiKey.setEnabled(!checking);
         apiModel.setEnabled(!checking);
         refreshModels.setEnabled(!checking);
-        resetAddress.setEnabled(!checking && !providerDraft.address.equals(urlDraft.trim()));
-        resetAddress.setAlpha(resetAddress.isEnabled() ? 1 : .45f);
+        if (providerName != null) providerName.setEnabled(!checking);
+        if (resetAddress != null) {
+            resetAddress.setEnabled(!checking && !providerDraft.address.equals(urlDraft.trim()));
+            resetAddress.setAlpha(resetAddress.isEnabled() ? 1 : .45f);
+        }
         verify.setEnabled(!checking);
         verify.setAlpha(checking ? .5f : 1);
         if (saveOnly != null) { saveOnly.setEnabled(!checking); saveOnly.setAlpha(checking ? .5f : 1); }
-        forget.setEnabled(saved && !checking);
-        forget.setAlpha(saved && !checking ? 1 : .45f);
+        manageKeys.setEnabled(endpoint != null && !checking);
+        manageKeys.setAlpha(manageKeys.isEnabled() ? 1f : .45f);
         showModelLookupState();
     }
 
@@ -2547,6 +2687,11 @@ final class NativeChat {
         String candidate = apiKey.getText().toString().trim();
         if (endpoint == null) { keyStatus = "请输入有效的 HTTP 或 HTTPS 接口地址。"; updateKeyFeedback(); return; }
         if (model.isEmpty() || model.matches(".*\\s.*")) { keyStatus = "请填写有效的模型 ID。"; updateKeyFeedback(); return; }
+        if (providerDraft == ApiProvider.CUSTOM && providerNameDraft.length() > 40) {
+            keyStatus = "提供商名称最多 40 个字符";
+            updateKeyFeedback();
+            return;
+        }
         if ((ApiProvider.requiresKey(endpoint) && candidate.isEmpty() && !services.hasKey(endpoint)) || candidate.matches(".*\\s.*")) {
             keyStatus = "请填写有效的 API Key。"; updateKeyFeedback(); return;
         }
@@ -2556,16 +2701,10 @@ final class NativeChat {
         pendingUrl = endpoint;
         pendingModel = model;
         pendingProvider = providerDraft;
+        pendingProviderName = providerDraft == ApiProvider.CUSTOM ? providerNameDraft : "";
         keyStatus = test ? "正在测试连接…" : "正在保存…";
         updateKeyFeedback();
         services.verify(endpoint, model, candidate, test);
-    }
-
-    private void forgetKey() {
-        String endpoint = editingEndpoint();
-        if (endpoint == null || checking || !mayChange()) return;
-        new AlertDialog.Builder(context).setTitle("移除此接口的 API Key？")
-            .setNegativeButton("取消", null).setPositiveButton("移除", (dialog, which) -> services.forget(endpoint)).show();
     }
 
     private void choicePopup(View anchor, ImageView arrow, String[] choices, int current, java.util.function.IntConsumer selected) {
@@ -2682,10 +2821,11 @@ final class NativeChat {
                     boolean saved = error.isEmpty() && event.optBoolean("saved");
                     keyStatus = error.isEmpty() ? event.optString("message", "API Key 已保存") : error;
                     if (saved) {
-                        state.saveConnection(pendingProvider, pendingUrl, pendingModel);
+                        state.saveConnection(pendingProvider, pendingUrl, pendingModel, pendingProviderName);
                         save();
                         if (screen == API_SETTINGS) {
                             providerDraft = pendingProvider;
+                            providerNameDraft = state.providerName(providerDraft);
                             urlDraft = state.preferredAddress(providerDraft);
                             modelDraft = pendingModel;
                             keyDraft = "";
@@ -2695,7 +2835,8 @@ final class NativeChat {
                     }
                     pendingUrl = pendingModel = null;
                     pendingProvider = null;
-                } else keyStatus = error.isEmpty() ? "API Key 已移除" : error;
+                    pendingProviderName = null;
+                }
                 updateKey();
                 updateKeyFeedback();
                 controls();

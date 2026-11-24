@@ -3,11 +3,13 @@ package com.jingliu.chat;
 import java.time.LocalDate;
 import java.time.format.TextStyle;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
 import java.util.UUID;
+import java.util.regex.Pattern;
 import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
@@ -15,6 +17,9 @@ import org.json.JSONObject;
 import static com.jingliu.chat.MainActivity.json;
 
 final class ChatState {
+    private static final Pattern SAFETY_MARKER = Pattern.compile(
+        "(?:<|&lt;)/?ds_safety(?:>|&gt;)", Pattern.CASE_INSENSITIVE);
+    private static final String SAFETY_OUTPUT = "接口返回了异常的审核文本，可重新生成回复。";
     static final String FLASH = "deepseek-flash";
     static final String PRO = "deepseek-v4-pro";
     final JSONObject data;
@@ -27,18 +32,20 @@ final class ChatState {
         final JSONObject chat;
         final JSONObject reply;
         final JSONObject request;
+        final String attachmentKey;
         boolean receivedFinish;
         String responseId = "";
         private long thinkingSinceNanos;
         boolean hasReasoning;
         boolean thinkingFinished;
 
-        Job(int id, String endpoint, JSONObject chat, JSONObject reply, JSONObject request) {
+        Job(int id, String endpoint, JSONObject chat, JSONObject reply, JSONObject request, String attachmentKey) {
             this.id = id;
             this.endpoint = endpoint;
             this.chat = chat;
             this.reply = reply;
             this.request = request;
+            this.attachmentKey = attachmentKey;
         }
 
         void beginThinking() {
@@ -105,6 +112,7 @@ final class ChatState {
         String preset = string(data, "apiPreset");
         if (ApiProvider.DEEPSEEK.name().equals(preset)) return ApiProvider.DEEPSEEK;
         if (ApiProvider.OPENAI.name().equals(preset)) return ApiProvider.OPENAI;
+        if (ApiProvider.CUSTOM.name().equals(preset)) return ApiProvider.CUSTOM;
         return custom() ? ApiProvider.OPENAI : ApiProvider.DEEPSEEK;
     }
 
@@ -130,7 +138,12 @@ final class ChatState {
         return profiles == null ? null : profiles.optJSONObject(provider.name());
     }
 
-    void saveConnection(ApiProvider provider, String endpoint, String model) {
+    String providerName(ApiProvider provider) {
+        String name = string(profile(provider), "name");
+        return name.isEmpty() ? provider.label : name;
+    }
+
+    void saveConnection(ApiProvider provider, String endpoint, String model, String name) {
         ApiProvider previous = apiProvider();
         String previousEndpoint = endpoint();
         JSONObject profiles = data.optJSONObject("apiProfiles");
@@ -139,8 +152,9 @@ final class ChatState {
             put(data, "apiProfiles", profiles);
         }
         if (previous != provider) put(profiles, previous.name(),
-            json("endpoint", previousEndpoint, "model", previousEndpoint.isEmpty() ? selectedModel() : string(data, "customModel")));
-        put(profiles, provider.name(), json("endpoint", endpoint, "model", model));
+            json("endpoint", previousEndpoint, "model", previousEndpoint.isEmpty() ? selectedModel() : string(data, "customModel"),
+                "name", string(profile(previous), "name")));
+        put(profiles, provider.name(), json("endpoint", endpoint, "model", model, "name", name));
         if (!previousEndpoint.equals(endpoint)) attachments.clear();
         put(data, "apiPreset", provider.name());
         put(data, "provider", endpoint.isEmpty() ? "official" : "custom");
@@ -171,6 +185,21 @@ final class ChatState {
     boolean sameProvider() {
         JSONObject chat = current();
         return chat == null || endpoint().equals(string(chat, "apiEndpoint"));
+    }
+
+    String attachmentKey() {
+        return attachmentKey(messages(), attachments);
+    }
+
+    private static String attachmentKey(JSONArray messages, List<JSONObject> queued) {
+        List<JSONObject> files = new ArrayList<>();
+        for (JSONObject message : objects(messages)) files.addAll(objects(array(message, "files")));
+        files.addAll(queued);
+        for (JSONObject file : files) {
+            String id = string(file, "keyId");
+            if (!id.isEmpty()) return id;
+        }
+        return files.isEmpty() ? null : "";
     }
 
     void activate(JSONObject chat) {
@@ -217,8 +246,32 @@ final class ChatState {
     }
 
     static String answer(JSONObject message) {
+        if (hiddenReply(message)) return "";
         if (message.has("text")) return string(message, "text");
         return merged(message, "text", "text");
+    }
+
+    static boolean hiddenReply(JSONObject message) {
+        return "assistant".equals(string(message, "role"))
+            && ("refusal".equals(string(message, "finish")) || containsSafetyOutput(message));
+    }
+
+    private static boolean containsSafetyOutput(JSONObject message) {
+        if (message.optBoolean("safetyOutput")) return true;
+        String text = message.has("text") ? string(message, "text") : merged(message, "text", "text");
+        return SAFETY_MARKER.matcher(text).find() || SAFETY_MARKER.matcher(merged(message, "thinking", "thinking")).find();
+    }
+
+    static String replyStatus(JSONObject message) {
+        if ("refusal".equals(string(message, "finish"))) return "接口未返回可显示的回复。";
+        return containsSafetyOutput(message) ? SAFETY_OUTPUT : string(message, "status");
+    }
+
+    private static void quarantineSafetyOutput(JSONObject reply) {
+        if (containsSafetyOutput(reply)) {
+            put(reply, "safetyOutput", true);
+            put(reply, "blocks", new JSONArray());
+        }
     }
 
     static String merged(JSONObject message, String type, String field) {
@@ -302,7 +355,8 @@ final class ChatState {
         JSONObject reply = json("role", "assistant", "blocks", new JSONArray(), "status", "回复已中断，可以重新生成。");
         if (requestedLookup) put(reply, "lookupRequested", true);
         next.put(reply);
-        job = new Job(++sequence, endpoint(), chat, reply, request);
+        job = new Job(++sequence, endpoint(), chat, reply, request,
+            custom() ? null : attachmentKey(next, Collections.emptyList()));
         return job;
     }
 
@@ -330,6 +384,8 @@ final class ChatState {
         if ("refusal".equals(reason)) {
             put(reply, "blocks", new JSONArray());
             status = "接口未返回可显示的回复。";
+        } else if (containsSafetyOutput(reply)) {
+            status = SAFETY_OUTPUT;
         } else if (status.isEmpty()) {
             if ("max_tokens".equals(reason)) status = "回复已达到输出上限。";
             else if (answer(reply).isEmpty()) status = "接口未返回文字回复。";
@@ -341,7 +397,7 @@ final class ChatState {
             }
         }
         put(reply, "status", status);
-        put(reply, "complete", error.isEmpty() && !"refusal".equals(reason));
+        put(reply, "complete", error.isEmpty() && !hiddenReply(reply));
         job = null;
     }
 
@@ -375,15 +431,16 @@ final class ChatState {
             if (delta == null) delta = choice.optJSONObject("message");
             String reasoning = string(delta, "reasoning_content");
             String content = string(delta, "content");
-            if (!reasoning.isEmpty()) {
+            if (!reply.optBoolean("safetyOutput") && !reasoning.isEmpty()) {
                 active.beginThinking();
                 active.hasReasoning = true;
                 appendCustom(blocks, 0, "thinking", "thinking", reasoning);
             }
-            if (!content.isEmpty()) {
+            if (!reply.optBoolean("safetyOutput") && !content.isEmpty()) {
                 active.endThinking();
                 appendCustom(blocks, 1, "text", "text", content);
             }
+            if (!reasoning.isEmpty() || !content.isEmpty()) quarantineSafetyOutput(reply);
             if (!choice.isNull("finish_reason")) {
                 String reason = choice.optString("finish_reason");
                 put(reply, "finish", "length".equals(reason) ? "max_tokens" : "content_filter".equals(reason) ? "refusal" : reason);
@@ -397,6 +454,7 @@ final class ChatState {
         switch (type) {
             case "message_start": put(reply, "status", "生成中…"); break;
             case "content_block_start": {
+                if (reply.optBoolean("safetyOutput")) break;
                 JSONObject block = event.optJSONObject("content_block");
                 if (block == null || index < 0 || index > 10000) break;
                 put(blocks, index, block);
@@ -408,9 +466,11 @@ final class ChatState {
                     if (!string(block, "text").isEmpty()) active.endThinking();
                     put(reply, "status", "生成中…");
                 }
+                quarantineSafetyOutput(reply);
                 break;
             }
             case "content_block_delta": {
+                if (reply.optBoolean("safetyOutput")) break;
                 JSONObject block = blocks.optJSONObject(index);
                 JSONObject delta = event.optJSONObject("delta");
                 if (block == null || delta == null) break;
@@ -428,6 +488,7 @@ final class ChatState {
                             active.hasReasoning = true;
                         } else if ("text".equals(field) && !addition.isEmpty()) active.endThinking();
                         put(block, field, string(block, field) + addition);
+                        if (!"signature".equals(field)) quarantineSafetyOutput(reply);
                     }
                 }
                 break;
@@ -437,7 +498,9 @@ final class ChatState {
                 if (delta == null) break;
                 put(reply, "finish", string(delta, "stop_reason"));
                 if ("refusal".equals(string(delta, "stop_reason"))) put(reply, "blocks", new JSONArray());
-                if (!active.chat.optBoolean("customTitle") && !string(delta, "title").isEmpty()) put(active.chat, "title", string(delta, "title"));
+                if (!reply.optBoolean("safetyOutput") && !active.chat.optBoolean("customTitle") && !string(delta, "title").isEmpty()) {
+                    put(active.chat, "title", string(delta, "title"));
+                }
                 break;
             }
             case "message_stop": finish(""); break;

@@ -66,7 +66,14 @@ $sources = @(Get-ChildItem "$main/java" -Recurse -Filter '*.java' | ForEach-Obje
 Invoke-Tool "$JavaHome/bin/javac.exe" (@('-encoding','UTF-8','--release','8','-classpath',((@($android) + $libraries) -join ';'),'-d',$classes) + $sources + "$build/com/jingliu/chat/R.java")
 $bytecode = @(Get-ChildItem $classes -Recurse -Filter '*.class' | ForEach-Object FullName)
 Invoke-Tool "$tool/d8.bat" (@('--lib',$android,'--min-api','26','--output',$build) + $bytecode + $libraries)
-Invoke-Tool "$JavaHome/bin/jar.exe" @('uf',$unsigned,'-C',$build,'classes.dex')
+$entities = 'org/commonmark/internal/util/entities.txt'
+Push-Location $classes
+try {
+    Invoke-Tool "$JavaHome/bin/jar.exe" @('xf',(Join-Path $build "commonmark-$version.jar"),$entities)
+} finally {
+    Pop-Location
+}
+Invoke-Tool "$JavaHome/bin/jar.exe" @('uf',$unsigned,'-C',$build,'classes.dex','-C',$classes,$entities)
 Invoke-Tool "$tool/zipalign.exe" @('-P','16','-f','4',$unsigned,$aligned)
 
 if (!(Test-Path $SigningStore)) {

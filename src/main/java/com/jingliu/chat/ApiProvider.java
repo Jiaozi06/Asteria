@@ -2,7 +2,8 @@ package com.jingliu.chat;
 
 enum ApiProvider {
     DEEPSEEK("DeepSeek", "https://api.deepseek.com", "https://platform.deepseek.com/api_keys"),
-    OPENAI("OpenAI", "https://api.openai.com/v1", "https://platform.openai.com/api-keys");
+    OPENAI("OpenAI", "https://api.openai.com/v1", "https://platform.openai.com/api-keys"),
+    CUSTOM("自定义提供商", "", "");
 
     final String label;
     final String address;

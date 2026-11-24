@@ -27,30 +27,6 @@ final class ModelOptions {
         RESERVED.addAll(Arrays.asList(COMPATIBLE_FIELDS));
     }
 
-    static JSONObject get(ChatState state) {
-        JSONObject all = state.data.optJSONObject(FIELD);
-        JSONObject options = all == null ? null : all.optJSONObject(scope(state));
-        return options == null ? new JSONObject() : options;
-    }
-
-    static void set(ChatState state, String key, Object value) {
-        JSONObject options = get(state);
-        if (value == null) options.remove(key);
-        else put(options, key, value);
-        JSONObject all = state.data.optJSONObject(FIELD);
-        if (all == null) {
-            all = new JSONObject();
-            put(state.data, FIELD, all);
-        }
-        if (options.length() == 0) all.remove(scope(state));
-        else put(all, scope(state), options);
-    }
-
-    static void reset(ChatState state) {
-        JSONObject all = state.data.optJSONObject(FIELD);
-        if (all != null) all.remove(scope(state));
-    }
-
     static JSONObject local(JSONObject chat) {
         JSONObject options = chat.optJSONObject(FIELD);
         return options == null ? new JSONObject() : options;
@@ -68,28 +44,6 @@ final class ModelOptions {
         chat.remove(FIELD);
     }
 
-    private static JSONObject effective(ChatState state, JSONObject chat) {
-        JSONObject options = new JSONObject();
-        JSONObject defaults = get(state);
-        Iterator<String> global = defaults.keys();
-        while (global.hasNext()) {
-            String name = global.next();
-            put(options, name, defaults.opt(name));
-        }
-        JSONObject overrides = local(chat);
-        Iterator<String> local = overrides.keys();
-        while (local.hasNext()) {
-            String name = local.next();
-            if (overrides.isNull(name)) options.remove(name);
-            else put(options, name, overrides.opt(name));
-        }
-        return options;
-    }
-
-    private static String scope(ChatState state) {
-        return state.custom() ? state.endpoint() + "\n" + string(state.data, "customModel") : "official";
-    }
-
     static String unsupportedKey(JSONObject extras) {
         Iterator<String> keys = extras.keys();
         while (keys.hasNext()) {
@@ -100,7 +54,7 @@ final class ModelOptions {
     }
 
     static void apply(ChatState state, JSONObject chat, JSONObject request, boolean thinking) {
-        JSONObject options = effective(state, chat);
+        JSONObject options = local(chat);
         List<String> instructions = new ArrayList<>();
         switch (string(options, "tone")) {
             case "friendly": instructions.add("Use a warm, friendly tone."); break;

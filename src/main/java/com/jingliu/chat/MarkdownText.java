@@ -11,6 +11,7 @@ import java.util.Arrays;
 import java.util.function.Consumer;
 import java.util.function.IntConsumer;
 import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import org.commonmark.ext.autolink.AutolinkExtension;
 import org.commonmark.ext.gfm.strikethrough.Strikethrough;
 import org.commonmark.ext.gfm.strikethrough.StrikethroughExtension;
@@ -22,6 +23,8 @@ import org.commonmark.parser.IncludeSourceSpans;
 import org.commonmark.parser.Parser;
 
 final class MarkdownText {
+    private static final Pattern BROKEN_APOSTROPHE =
+        Pattern.compile("(?<=\\p{L})#(?:0*39|[xX]0*27);(?=\\p{L})");
     private static final Parser PARSER = Parser.builder()
         .extensions(Arrays.asList(TablesExtension.create(), StrikethroughExtension.create(),
             TaskListItemsExtension.create(), AutolinkExtension.create()))
@@ -92,7 +95,10 @@ final class MarkdownText {
 
     private void append(Node node, int depth) {
         int start = text.length();
-        if (node instanceof Text) text.append(((Text) node).getLiteral());
+        if (node instanceof Text) {
+            String literal = ((Text) node).getLiteral();
+            text.append(BROKEN_APOSTROPHE.matcher(literal).replaceAll("'"));
+        }
         else if (node instanceof SoftLineBreak || node instanceof HardLineBreak) text.append('\n');
         else if (node instanceof HtmlInline) text.append(((HtmlInline) node).getLiteral());
         else if (node instanceof HtmlBlock) text.append(((HtmlBlock) node).getLiteral()).append('\n');

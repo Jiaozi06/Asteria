@@ -45,9 +45,16 @@ public final class MainActivity extends Activity {
     private AtomicFile stateFile;
     private final Services services = new Services();
     private Recording recording;
+    private String pendingUploadKey = "";
     private SpeechRecognizer dictation;
     private boolean voicePermissionSystem, voicePermissionHold;
     private PhoneSpeech speech;
+    private boolean checkingUpdate, manualUpdate;
+
+    @Override protected void onStart() {
+        super.onStart();
+        services.checkUpdate(false);
+    }
 
     @Override public void onCreate(Bundle saved) {
         super.onCreate(saved);
@@ -148,6 +155,26 @@ public final class MainActivity extends Activity {
     }
 
     final class Services {
+        void checkUpdate(boolean manual) {
+            manualUpdate |= manual;
+            if (checkingUpdate) return;
+            checkingUpdate = true;
+            worker.execute(() -> {
+                String tag = null;
+                try {
+                    String installed = getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
+                    tag = AppUpdate.check(installed, AppUpdate.preferMirror(Locale.getDefault()));
+                } catch (Exception ignored) { }
+                String result = tag;
+                runOnUiThread(() -> {
+                    checkingUpdate = false;
+                    boolean requested = manualUpdate;
+                    manualUpdate = false;
+                    if (!isDestroyed() && !isFinishing()) screen.updateAvailable(result, requested);
+                });
+            });
+        }
+
         String loadState() {
             synchronized (stateFile) {
                 try { return new String(stateFile.readFully(), StandardCharsets.UTF_8); }
@@ -171,6 +198,26 @@ public final class MainActivity extends Activity {
         }
 
         boolean hasKey(String endpoint) { return !vault.read(endpoint).isEmpty(); }
+
+        List<KeyVault.Entry> savedKeys(String endpoint) throws Exception { return vault.entries(endpoint); }
+
+        KeyVault.Mode keyMode(String endpoint) { return vault.mode(endpoint); }
+
+        boolean setKeyMode(String endpoint, KeyVault.Mode mode) { return vault.setMode(endpoint, mode); }
+
+        int keyVisibleLength(String endpoint) { return vault.visibleLength(endpoint); }
+
+        boolean setKeyVisibleLength(String endpoint, int count) { return vault.setVisibleLength(endpoint, count); }
+
+        String addKey(String endpoint, String key) {
+            try { vault.save(endpoint, key); return ""; }
+            catch (Exception error) { return failure(error).replace(key, "••••"); }
+        }
+
+        String removeKey(String endpoint, String id) {
+            try { vault.remove(endpoint, id); return ""; }
+            catch (Exception error) { return "无法移除已保存的密钥"; }
+        }
 
         void discoverModels(int id, String endpoint, String candidate) {
             worker.execute(() -> {
@@ -225,18 +272,18 @@ public final class MainActivity extends Activity {
             });
         }
 
-        void forget(String endpoint) {
-            boolean cleared = vault.clear(endpoint);
-            emit("key", json("endpoint", endpoint, "saved", !cleared && hasKey(endpoint), "error", cleared ? "" : "无法移除已保存的 Key。"));
-        }
-
-        void stream(int id, String endpoint, String body, boolean compactContext) {
+        void stream(int id, String endpoint, String body, boolean compactContext, String attachmentKey) {
             DeepSeek.Request request = new DeepSeek.Request();
             streams.put(id, request);
             worker.execute(() -> {
                 String key = "";
                 try {
-                    key = vault.read(endpoint);
+                    if (attachmentKey == null) key = vault.next(endpoint);
+                    else {
+                        KeyVault.Credential attachment = vault.forAttachment(endpoint, attachmentKey);
+                        if (attachment == null) throw new DeepSeek.ApiError("无法使用原附件的密钥，请重新上传附件");
+                        key = attachment.value;
+                    }
                     if (ApiProvider.requiresKey(endpoint) && key.isEmpty()) throw new DeepSeek.ApiError("请先配置当前接口的 API Key。");
                     DeepSeek.stream(request, endpoint, key, body, compactContext, event -> emit("stream", json("id", id, "event", event)));
                     emit("streamEnd", json("id", id));
@@ -252,8 +299,9 @@ public final class MainActivity extends Activity {
 
         void cancel(int id) { MainActivity.this.cancel(streams.get(id)); }
 
-        void pickFile(boolean imagesOnly) {
+        void pickFile(boolean imagesOnly, String keyId) {
             runOnUiThread(() -> {
+                pendingUploadKey = keyId == null ? "" : keyId;
                 Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT)
                     .setType(imagesOnly ? "image/*" : "*/*").addCategory(Intent.CATEGORY_OPENABLE);
                 try { startActivityForResult(intent, SELECT_FILE); }
@@ -318,13 +366,16 @@ public final class MainActivity extends Activity {
     @Override protected void onActivityResult(int request, int result, Intent data) {
         super.onActivityResult(request, result, data);
         if (request != SELECT_FILE) return;
+        String keyId = pendingUploadKey;
+        pendingUploadKey = "";
         if (result != RESULT_OK || data == null || data.getData() == null) { emit("upload", json()); return; }
         Uri uri = data.getData();
-        worker.execute(() -> upload(uri));
+        worker.execute(() -> upload(uri, keyId));
     }
 
-    private void upload(Uri uri) {
+    private void upload(Uri uri, String keyId) {
         DeepSeek.Request request = new DeepSeek.Request();
+        String key = "";
         try {
             String name = "attachment";
             long size = -1;
@@ -343,12 +394,18 @@ public final class MainActivity extends Activity {
             if (size > limit) throw new DeepSeek.ApiError("文件超过 " + limit / MIB + " MiB。");
             try (InputStream input = getContentResolver().openInputStream(uri)) {
                 if (input == null) throw new IOException();
-                HttpURLConnection connection = request.open("/files", "POST", requireKey());
+                KeyVault.Credential attachment = vault.forAttachment("", keyId);
+                if (attachment == null) throw new DeepSeek.ApiError("请先配置用于附件上传的 DeepSeek 密钥");
+                key = attachment.value;
+                HttpURLConnection connection = request.open("/files", "POST", key);
                 DeepSeek.multipart(connection, parsed ? "rich_layout_recognition" : "user_data", name, input, limit);
                 JSONObject response = DeepSeek.json(connection);
-                emit("upload", json("id", response.getString("id"), "name", name, "image", image));
+                emit("upload", json("id", response.getString("id"), "name", name, "image", image, "keyId", attachment.id));
             }
-        } catch (Exception e) { emit("upload", json("error", failure(e))); }
+        } catch (Exception e) {
+            String message = failure(e);
+            emit("upload", json("error", key.isEmpty() ? message : message.replace(key, "••••")));
+        }
         finally { request.close(); }
     }
 

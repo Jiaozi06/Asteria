@@ -51,6 +51,7 @@ final class WebSources {
 
     static WebSources from(JSONObject message) {
         WebSources result = new WebSources();
+        if (ChatState.hiddenReply(message)) return result;
         List<JSONObject> blocks = objects(array(message, "blocks"));
         for (JSONObject block : blocks) {
             String type = string(block, "type");
@@ -69,6 +70,7 @@ final class WebSources {
     }
 
     String annotatedAnswer(JSONObject message) {
+        if (ChatState.hiddenReply(message)) return "";
         StringBuilder result = new StringBuilder();
         boolean hasBlocks = false;
         for (JSONObject block : objects(array(message, "blocks"))) {
