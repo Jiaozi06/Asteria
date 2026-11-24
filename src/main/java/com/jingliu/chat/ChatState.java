@@ -62,6 +62,7 @@ final class ChatState {
     }
 
     private int sequence;
+    private JSONObject draftChat = new JSONObject();
 
     ChatState(String stored) {
         JSONObject loaded;
@@ -106,6 +107,25 @@ final class ChatState {
         return null;
     }
     JSONArray messages() { return array(current(), "messages"); }
+
+    JSONObject optionsTarget() {
+        JSONObject chat = current();
+        return chat == null ? draftChat : chat;
+    }
+
+    boolean thinkingEnabled() { return thinkingEnabled(data.optBoolean("think")); }
+
+    boolean thinkingEnabled(boolean fallback) {
+        return ModelOptions.local(optionsTarget()).optBoolean("think", fallback);
+    }
+
+    void toggleThinking() {
+        JSONObject chat = optionsTarget();
+        boolean enabled = !thinkingEnabled();
+        if (ModelOptions.local(chat).isNull("think")) put(data, "think", enabled);
+        else ModelOptions.setLocal(chat, "think", enabled);
+    }
+
     boolean custom() { return "custom".equals(data.optString("provider")); }
     String endpoint() { return custom() ? string(data, "customUrl") : ""; }
     ApiProvider apiProvider() {
@@ -204,6 +224,7 @@ final class ChatState {
 
     void activate(JSONObject chat) {
         put(data, "active", chat == null ? JSONObject.NULL : chat.optString("id"));
+        draftChat = new JSONObject();
         attachments.clear();
     }
 
@@ -289,8 +310,10 @@ final class ChatState {
             String title = string(user, "text");
             if (title.isEmpty()) title = array(user, "files").optJSONObject(0).optString("name");
             int max = Math.min(title.codePointCount(0, title.length()), 40);
-            chat = json("id", UUID.randomUUID().toString(), "title", title.substring(0, title.offsetByCodePoints(0, max)),
-                "apiEndpoint", endpoint());
+            chat = draftChat;
+            put(chat, "id", UUID.randomUUID().toString());
+            put(chat, "title", title.substring(0, title.offsetByCodePoints(0, max)));
+            put(chat, "apiEndpoint", endpoint());
             chats().put(chat);
             activate(chat);
         }
@@ -324,7 +347,7 @@ final class ChatState {
                 protocol.put(json("role", "assistant", "content", content));
             }
         }
-        boolean thinkEnabled = user.optBoolean("think", data.optBoolean("think"));
+        boolean thinkEnabled = user.optBoolean("think", thinkingEnabled());
         boolean searchEnabled = user.optBoolean("search", data.optBoolean("search"));
         String prompt = string(user, "text");
         boolean requestedLookup = !custom() && searchEnabled && WebSources.explicitLookup(prompt);

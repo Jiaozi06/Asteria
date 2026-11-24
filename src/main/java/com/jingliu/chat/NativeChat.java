@@ -93,8 +93,6 @@ final class NativeChat {
     private FrameLayout voiceOverlay;
     private VoiceHalo voiceHalo;
     private TextView voiceHint;
-    private LinearLayout chatTitles;
-    private ImageButton chatOptions;
     private ImageButton send, mic, add, returnBottom;
     private EditText input, apiKey, apiUrl, apiModel, providerName;
     private LinearLayout modelRow;
@@ -396,7 +394,6 @@ final class NativeChat {
         if (android.os.Build.VERSION.SDK_INT >= 28) heading.setAccessibilityHeading(true);
         titles.addView(heading, MATCH_PARENT, WRAP_CONTENT);
         if (chat) {
-            chatTitles = titles;
             chatTitle = heading;
             chatModel = text("", 11, dark ? 0xff9ba2ad : 0xff667180);
             chatModel.setSingleLine();
@@ -405,13 +402,13 @@ final class NativeChat {
         }
         FrameLayout.LayoutParams position = new FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT, Gravity.START | Gravity.CENTER_VERTICAL);
         position.setMarginStart(dp(61));
-        position.setMarginEnd(dp(61));
+        boolean showLog = chat && services.requestLoggingEnabled();
+        position.setMarginEnd(dp(chat ? (showLog ? 148 : 104) : 61));
         bar.addView(titles, position);
         if (chat) {
             FrameLayout.LayoutParams trailing = new FrameLayout.LayoutParams(dp(48), dp(48), Gravity.END | Gravity.CENTER_VERTICAL);
             trailing.setMarginEnd(dp(8));
             bar.addView(icon(R.drawable.ic_plus, "新对话", () -> activate(null)), trailing);
-            boolean showLog = services.requestLoggingEnabled();
             if (showLog) {
                 FrameLayout.LayoutParams logs = new FrameLayout.LayoutParams(dp(44), dp(48), Gravity.END | Gravity.CENTER_VERTICAL);
                 logs.setMarginEnd(dp(56));
@@ -419,8 +416,7 @@ final class NativeChat {
             }
             FrameLayout.LayoutParams options = new FrameLayout.LayoutParams(dp(44), dp(48), Gravity.END | Gravity.CENTER_VERTICAL);
             options.setMarginEnd(dp(showLog ? 100 : 56));
-            chatOptions = icon(R.drawable.ic_settings, "对话高级设置", this::openChatOptions);
-            bar.addView(chatOptions, options);
+            bar.addView(icon(R.drawable.ic_settings, "对话高级设置", this::openChatOptions), options);
         }
         divider(layout);
     }
@@ -577,9 +573,7 @@ final class NativeChat {
     private void toggle(String option) {
         if (state.custom()) {
             if ("think".equals(option)) {
-                if (state.current() == null) {
-                    composerNotice("深度思考", "发送第一条消息后，可从对话顶部的齿轮调整推理强度。", "", null);
-                } else openChatOptions();
+                openChatOptions();
             } else {
                 composerNotice("智能搜索", "当前的联网搜索使用 DeepSeek 官方接口。", "API 设置", this::openApiSettings);
             }
@@ -589,7 +583,8 @@ final class NativeChat {
             if ("think".equals(option)) editing.think = !editing.think;
             else editing.search = !editing.search;
         } else {
-            put(state.data, option, !state.data.optBoolean(option));
+            if ("think".equals(option)) state.toggleThinking();
+            else put(state.data, option, !state.data.optBoolean(option));
             save();
         }
         controls();
@@ -706,7 +701,7 @@ final class NativeChat {
         boolean official = !state.custom();
         boolean voice = voiceMode && !modifying && !generating;
         updateChatHeader();
-        setChip(think, official && (modifying ? editing.think : state.data.optBoolean("think")));
+        setChip(think, official && (modifying ? editing.think : state.thinkingEnabled()));
         setChip(search, official && (modifying ? editing.search : state.data.optBoolean("search")));
         think.setEnabled(!generating);
         search.setEnabled(!generating);
@@ -747,14 +742,6 @@ final class NativeChat {
 
     private void updateChatHeader() {
         JSONObject chat = state.current();
-        boolean canEdit = chat != null;
-        chatOptions.setVisibility(canEdit ? View.VISIBLE : View.GONE);
-        FrameLayout.LayoutParams titleArea = (FrameLayout.LayoutParams) chatTitles.getLayoutParams();
-        int end = dp(61 + (canEdit ? 43 : 0) + (services.requestLoggingEnabled() ? 44 : 0));
-        if (titleArea.getMarginEnd() != end) {
-            titleArea.setMarginEnd(end);
-            chatTitles.setLayoutParams(titleArea);
-        }
         String title = string(chat, "title").replaceAll("\\s+", " ").trim();
         if (title.isEmpty()) title = "新对话";
         if (!title.contentEquals(chatTitle.getText())) chatTitle.setText(title);
@@ -849,7 +836,7 @@ final class NativeChat {
         JSONArray files = new JSONArray();
         for (JSONObject file : state.attachments) files.put(file);
         EditSession session = editing;
-        boolean think = session == null ? state.data.optBoolean("think") : session.think;
+        boolean think = session == null ? state.thinkingEnabled() : session.think;
         boolean search = session == null ? state.data.optBoolean("search") : session.search;
         if (session == null) {
             state.attachments.clear();
@@ -869,7 +856,7 @@ final class NativeChat {
         services.hideKeyboard();
         input.clearFocus();
         editing = new EditSession(index, draft, state.attachments,
-            message.optBoolean("think", state.data.optBoolean("think")),
+            state.thinkingEnabled(message.optBoolean("think", state.data.optBoolean("think"))),
             message.optBoolean("search", state.data.optBoolean("search")));
         state.attachments.clear();
         state.attachments.addAll(objects(array(message, "files")));
@@ -1374,6 +1361,7 @@ final class NativeChat {
         if (!mayChange() || !requireKey() || !allowProvider()) return;
         JSONObject prior = state.messages().optJSONObject(index - 1);
         if (prior == null || !"user".equals(prior.optString("role"))) return;
+        if (!state.custom()) put(prior, "think", state.thinkingEnabled(prior.optBoolean("think", state.data.optBoolean("think"))));
         generate(prior, index - 1);
     }
     private void copy(String value) { services.copy(value); toast("已复制"); }
@@ -1904,9 +1892,8 @@ final class NativeChat {
     }
 
     private void openChatOptions() {
-        JSONObject chat = state.current();
-        if (screen != CHAT || chat == null || !allowProvider() || !prepareSettingsFromChat()) return;
-        editedOptionsChat = chat;
+        if (screen != CHAT || !allowProvider() || !prepareSettingsFromChat()) return;
+        editedOptionsChat = state.optionsTarget();
         screen = MODEL_SETTINGS;
         show(Motion.PUSH, false);
     }
@@ -2144,8 +2131,10 @@ final class NativeChat {
         String model = state.effectiveModel();
         String provider = custom ? state.providerName(state.apiProvider()) + " · " + (model.isEmpty() ? "尚未选择模型" : model)
             : "DeepSeek 官方 · Flash / V4 Pro";
-        settingsNote(body, string(editedOptionsChat, "title") + "\n" + provider
-            + "\n设置仅影响当前对话。未设置的参数使用接口默认值。");
+        boolean newChat = state.current() == null;
+        String title = newChat ? "新对话" : string(editedOptionsChat, "title");
+        settingsNote(body, title + "\n" + provider
+            + (newChat ? "\n这些设置从第一条消息开始生效。" : "\n设置仅影响当前对话。"));
 
         LinearLayout style = settingsGroup(body, "回复风格");
         modelChoice(style, "回复语气", "tone",
@@ -2176,7 +2165,7 @@ final class NativeChat {
         } else {
             modelChoice(output, "推理强度", "reasoning_effort",
                 new String[]{"默认", "Low", "High", "Max"}, new String[]{"", "low", "high", "max"});
-            settingsNote(body, "推理强度在聊天里打开「深度思考」后生效。");
+            settingsNote(body, "选择 Low、High 或 Max 会为当前对话打开深度思考。关闭深度思考后，推理强度不生效。");
         }
 
         LinearLayout sampling = settingsGroup(body, "采样");
@@ -2223,7 +2212,7 @@ final class NativeChat {
             panel.addView(note, MATCH_PARENT, WRAP_CONTENT);
             sheetActions(panel, "取消", dialog::dismiss, "恢复", () -> {
                 ModelOptions.resetLocal(editedOptionsChat);
-                save();
+                if (state.current() != null) save();
                 dialog.dismiss();
                 show(Motion.FADE, false);
             });
@@ -2244,7 +2233,10 @@ final class NativeChat {
 
     private void storeModelOption(String key, Object value) {
         ModelOptions.setLocal(editedOptionsChat, key, value);
-        save();
+        if (!state.custom() && "reasoning_effort".equals(key) && value != null) {
+            ModelOptions.setLocal(editedOptionsChat, "think", true);
+        }
+        if (state.current() != null) save();
     }
 
     private void modelChoice(LinearLayout group, String title, String key, String[] labels, String[] values) {
