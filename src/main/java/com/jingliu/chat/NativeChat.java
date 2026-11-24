@@ -2043,9 +2043,14 @@ final class NativeChat {
         gap(brand, 12);
         TextView name = text("Asteria", 24, ink);
         bold(name);
-        brand.addView(name);
+        name.setGravity(Gravity.CENTER);
+        brand.addView(name, MATCH_PARENT, WRAP_CONTENT);
         String version = appVersion();
-        if (!version.isEmpty()) brand.addView(text(version, 13, muted));
+        if (!version.isEmpty()) {
+            TextView versionLabel = text(version, 13, muted);
+            versionLabel.setGravity(Gravity.CENTER);
+            brand.addView(versionLabel, MATCH_PARENT, WRAP_CONTENT);
+        }
         gap(brand, 11);
         TextView description = text("开源原生 Android 聊天客户端，支持 DeepSeek 和 OpenAI 兼容接口。", 14, muted);
         description.setGravity(Gravity.CENTER);
