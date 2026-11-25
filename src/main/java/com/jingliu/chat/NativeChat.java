@@ -2252,7 +2252,7 @@ final class NativeChat {
         divider(project);
         settingsRow(project, R.drawable.ic_edit, "问题反馈", "", () -> services.open(AppUpdate.PROJECT_URL + "/issues"));
         divider(project);
-        settingsRow(project, R.drawable.ic_request_log, "项目许可证", "非商业用途",
+        settingsRow(project, R.drawable.ic_request_log, "项目许可证", "PolyForm NC 1.0.0",
             () -> services.open("https://polyformproject.org/licenses/noncommercial/1.0.0"));
     }
 
