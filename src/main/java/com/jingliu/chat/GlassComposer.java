@@ -26,27 +26,36 @@ final class GlassComposer extends LinearLayout {
     private final int tint, surface, edge;
     private final float radius, lineWidth;
     private final boolean dark;
+    private final GlassBackdrop backdrop;
     private Shader rim;
     private ValueAnimator pressAnimation;
     private float touchX, touchY, highlight;
 
     static boolean supported() {
+        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU;
+    }
+
+    static boolean nativeBackdropSupported() {
         return Build.VERSION.SDK_INT >= Build.VERSION_CODES.CINNAMON_BUN
             && Build.VERSION.SDK_INT_FULL >= Build.VERSION_CODES_FULL.CINNAMON_BUN_2;
     }
 
-    GlassComposer(Context context, boolean dark, int surface, int edge, float radius) {
+    GlassComposer(Context context, boolean dark, int surface, int edge, float radius, GlassBackdrop backdrop) {
         super(context);
         this.dark = dark;
         this.surface = surface;
         this.edge = edge;
         this.radius = radius;
-        this.tint = (surface & 0x00ffffff) | (dark ? 0xd1000000 : 0xdc000000);
+        this.backdrop = backdrop;
+        int tintAlpha = backdrop == null ? (dark ? 0xd1 : 0xdc) : (dark ? 0xb0 : 0xad);
+        this.tint = (surface & 0x00ffffff) | (tintAlpha << 24);
         lineWidth = getResources().getDisplayMetrics().density;
         sheen = new RadialGradient(0f, 0f, 1f, new int[] {dark ? 0xffa1c9ff : 0xff729ee7, 0x00729ee7},
             null, Shader.TileMode.CLAMP);
-        float blur = 15f * lineWidth;
-        setBackdropRenderEffect(RenderEffect.createBlurEffect(blur, blur, Shader.TileMode.CLAMP));
+        if (backdrop == null && nativeBackdropSupported()) {
+            float blur = 15f * lineWidth;
+            setBackdropRenderEffect(RenderEffect.createBlurEffect(blur, blur, Shader.TileMode.CLAMP));
+        }
         setOutlineProvider(new ViewOutlineProvider() {
             @Override public void getOutline(View view, Outline outline) {
                 outline.setRoundRect(0, 0, view.getWidth(), view.getHeight(), radius);
@@ -72,9 +81,10 @@ final class GlassComposer extends LinearLayout {
     @Override protected void onDraw(Canvas canvas) {
         super.onDraw(canvas);
         if (rim == null) return;
-        boolean blur = canvas.isHardwareAccelerated();
         canvas.save();
         canvas.clipPath(outline);
+        boolean blur = canvas.isHardwareAccelerated()
+            && (backdrop == null || backdrop.drawBehind(canvas, this, radius));
         paint.setColor(blur ? tint : surface);
         canvas.drawPath(outline, paint);
         if (highlight > 0f) {

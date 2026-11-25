@@ -683,7 +683,10 @@ final class NativeChat {
         transcript.setClipToPadding(false);
         transcript.setVerticalScrollBarEnabled(false);
         header("新对话", R.drawable.ic_menu, "对话历史", () -> drawer.open(), true);
-        FrameLayout chatBody = new FrameLayout(context);
+        boolean glass = state.data.optBoolean(GLASS_COMPOSER) && GlassComposer.supported();
+        GlassBackdrop backdrop = glass && !GlassComposer.nativeBackdropSupported()
+            ? new GlassBackdrop(context, transcript, bg) : null;
+        FrameLayout chatBody = backdrop != null ? backdrop : new FrameLayout(context);
         layout.addView(chatBody, new LinearLayout.LayoutParams(MATCH_PARENT, 0, 1));
         chatBody.addView(transcript, MATCH_PARENT, MATCH_PARENT);
         editShade = new View(context);
@@ -730,11 +733,12 @@ final class NativeChat {
         content.addView(messages, MATCH_PARENT, WRAP_CONTENT);
         LinearLayout footer = chatFooter = vertical();
         pad(footer, 13, 0);
-        boolean glass = state.data.optBoolean(GLASS_COMPOSER) && GlassComposer.supported();
+        LinearLayout composer = glass ? new GlassComposer(context, dark, surface, edge, dp(20), backdrop) : vertical();
         if (glass) {
             chatBody.addView(footer, new FrameLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT, Gravity.BOTTOM));
             ScrollView scroll = transcript;
             footer.addOnLayoutChangeListener((view, l, t, r, b, ol, ot, or, ob) -> {
+                if (backdrop != null) composer.invalidate();
                 if (transcript != scroll || content.getPaddingBottom() == b - t) return;
                 boolean follow = nearBottom();
                 int overlap = b - t;
@@ -747,7 +751,6 @@ final class NativeChat {
             layout.addView(footer, MATCH_PARENT, WRAP_CONTENT);
         }
 
-        LinearLayout composer = glass ? new GlassComposer(context, dark, surface, edge, dp(20)) : vertical();
         pad(composer, 7, 5);
         if (!glass) composer.setBackground(box(surface, edge, 20));
         footer.addView(composer, MATCH_PARENT, WRAP_CONTENT);
@@ -3133,8 +3136,11 @@ final class NativeChat {
         LinearLayout chat = settingsGroup(body, "聊天输入栏");
         boolean glass = GlassComposer.supported();
         experimentSwitch(chat, R.drawable.ic_theme, "输入栏玻璃效果", GLASS_COMPOSER, glass);
-        settingsNote(body, glass ? "开启后，滚动经过输入栏下方的聊天内容会实时模糊，按压时会出现柔和的高光。"
-            : "输入栏玻璃效果需要 Android 17 QPR2（API 37.2）或更新版本。");
+        settingsNote(body, glass
+            ? (GlassComposer.nativeBackdropSupported()
+                ? "开启后，输入栏下方的内容会实时模糊，按压时会出现柔和的高光。"
+                : "开启后，输入栏下方的聊天内容会实时模糊，边缘带有轻微折射，按压时会出现柔和的高光。")
+            : "输入栏玻璃效果需要 Android 13 或更新版本。");
     }
 
     private void experimentSwitch(LinearLayout group, int icon, String label, String key, boolean available) {
