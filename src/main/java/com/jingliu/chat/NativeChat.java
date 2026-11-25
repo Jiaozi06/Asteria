@@ -13,6 +13,7 @@ import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.RippleDrawable;
+import android.net.Uri;
 import android.text.InputType;
 import android.text.TextUtils;
 import android.transition.ChangeBounds;
@@ -30,6 +31,7 @@ import android.view.Window;
 import android.view.WindowManager;
 import android.view.animation.PathInterpolator;
 import android.widget.*;
+import java.net.URI;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneId;
@@ -78,6 +80,7 @@ final class NativeChat {
     private View screenView;
     private HistoryDrawer drawer;
     private boolean settingsFromDrawer, apiFromSettings, managingHistory;
+    private Dialog historyImportProgress;
     private int settingsReturnScroll = -1;
     private String historyFilter = "";
     private final Set<String> selectedChats = new HashSet<>();
@@ -254,7 +257,7 @@ final class NativeChat {
     }
 
     private void save() {
-        if (!services.saveState(state.data.toString())) toast("本地记录写入失败。");
+        if (!services.saveState(state.data)) toast("本地记录写入失败。");
     }
 
     boolean back() {
@@ -437,7 +440,7 @@ final class NativeChat {
         if (chat) {
             FrameLayout.LayoutParams trailing = new FrameLayout.LayoutParams(dp(48), dp(48), Gravity.END | Gravity.CENTER_VERTICAL);
             trailing.setMarginEnd(dp(8));
-            bar.addView(icon(R.drawable.ic_plus, "新对话", () -> activate(null)), trailing);
+            bar.addView(icon(R.drawable.ic_new_chat, "新对话", () -> activate(null)), trailing);
             if (showLog) {
                 FrameLayout.LayoutParams logs = new FrameLayout.LayoutParams(dp(44), dp(48), Gravity.END | Gravity.CENTER_VERTICAL);
                 logs.setMarginEnd(dp(56));
@@ -747,7 +750,7 @@ final class NativeChat {
         }
     }
 
-    private boolean busy() { return state.job != null || upload || recording || transcribing; }
+    private boolean busy() { return state.job != null || upload || recording || transcribing || historyImportProgress != null; }
 
     private void controls() {
         if (screen != CHAT) return;
@@ -1199,7 +1202,9 @@ final class NativeChat {
                 return true;
             });
         }
-        for (JSONObject file : objects(array(message, "files"))) {
+        List<JSONObject> files = objects(array(message, "files"));
+        files.addAll(objects(array(message, "archivedFiles")));
+        for (JSONObject file : files) {
             TextView attachment = text("附件 · " + file.optString("name"), 13, blue);
             ChatFont.apply(attachment, 13, ChatFont.scale(state.data));
             attachment.setMaxWidth(dp(270));
@@ -2140,6 +2145,8 @@ final class NativeChat {
             returnToChat(true);
         });
         divider(connection);
+        settingsRow(connection, R.drawable.ic_import_history, "导入 DeepSeek 对话", "", this::showHistoryImport);
+        divider(connection);
         LinearLayout compressionRow = settingsLine(connection, R.drawable.ic_compress);
         Switch compression = new Switch(context);
         compression.setText("自动压缩上下文");
@@ -2200,6 +2207,79 @@ final class NativeChat {
             screen = ABOUT;
             show(Motion.PUSH, false);
         });
+    }
+
+    private void showHistoryImport() {
+        if (!mayChange()) return;
+        Dialog dialog = newSheet();
+        LinearLayout panel = settingsSheet(dialog, "导入 DeepSeek 对话");
+        TextView details = text("粘贴官方导出链接，或选择已下载的 ZIP。已有对话会保留，重复记录会跳过。", 14, muted);
+        pad(details, 6, 12);
+        panel.addView(details, MATCH_PARENT, WRAP_CONTENT);
+        EditText address = field("DeepSeek 导出下载链接", false);
+        address.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        address.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS);
+        address.setSaveEnabled(false);
+        panel.addView(address, MATCH_PARENT, WRAP_CONTENT);
+        gap(panel, 8);
+        sheetActions(panel, "选择 ZIP", () -> {
+            services.hideKeyboard();
+            dialog.dismiss();
+            services.pickHistoryArchive();
+        }, "下载并导入", () -> {
+            URI link = DeepSeekHistoryImport.officialLink(address.getText().toString());
+            if (link == null) {
+                address.setError("请粘贴 DeepSeek 官方导出的完整 HTTPS 下载链接");
+                return;
+            }
+            services.hideKeyboard();
+            address.setText("");
+            dialog.dismiss();
+            startHistoryImport(link, null);
+        });
+        showSheet(dialog, panel);
+    }
+
+    void startHistoryImport(URI link, Uri document) {
+        if (!mayChange()) return;
+        Set<String> existing = new HashSet<>();
+        for (JSONObject chat : objects(state.chats())) existing.add(string(chat, "id"));
+        historyImportProgress = new AlertDialog.Builder(context)
+            .setTitle("正在导入对话")
+            .setMessage("正在读取 DeepSeek 导出包")
+            .setCancelable(false)
+            .show();
+        services.importHistory(link, document, existing);
+    }
+
+    void closeHistoryProgress() {
+        if (historyImportProgress == null) return;
+        historyImportProgress.dismiss();
+        historyImportProgress = null;
+    }
+
+    void historyImported(List<JSONObject> imported, String error) {
+        closeHistoryProgress();
+        if (!error.isEmpty()) {
+            toast(error);
+            return;
+        }
+        if (imported.isEmpty()) {
+            toast("没有可新增的对话");
+            return;
+        }
+        JSONArray previous = state.chats();
+        JSONArray merged = new JSONArray();
+        for (int i = 0; i < previous.length(); i++) merged.put(previous.opt(i));
+        for (JSONObject chat : imported) merged.put(chat);
+        put(state.data, "chats", merged);
+        if (!services.saveState(state.data)) {
+            put(state.data, "chats", previous);
+            toast("本地记录写入失败，导入已取消");
+            return;
+        }
+        if (screen == CHAT) refreshHistory();
+        toast("已导入 " + imported.size() + " 条对话");
     }
 
     private String appVersion() {

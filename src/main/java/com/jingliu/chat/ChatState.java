@@ -65,11 +65,17 @@ final class ChatState {
     private JSONObject draftChat = new JSONObject();
 
     ChatState(String stored) {
-        JSONObject loaded;
-        try { loaded = new JSONObject(stored); }
-        catch (JSONException ignored) { loaded = new JSONObject(); }
-        data = loaded;
+        this(parseStored(stored));
+    }
+
+    ChatState(JSONObject stored) {
+        data = stored;
         if (data.optJSONArray("chats") == null) put(data, "chats", new JSONArray());
+    }
+
+    private static JSONObject parseStored(String stored) {
+        try { return new JSONObject(stored); }
+        catch (JSONException ignored) { return new JSONObject(); }
     }
 
     static void put(JSONObject object, String key, Object value) {
@@ -339,10 +345,10 @@ final class ChatState {
                             "source", json("type", "file", "file_id", file.optString("id"))));
                     }
                     if (!text.isEmpty()) content.put(json("type", "text", "text", text));
-                    protocol.put(json("role", role, "content", content));
+                    if (content.length() > 0) protocol.put(json("role", role, "content", content));
                 }
-            } else if (!text.isEmpty() && !"refusal".equals(message.optString("finish"))) {
-                Object content = custom() ? text : message.optBoolean("complete") ? array(message, "blocks")
+            } else if (!text.isEmpty() && !message.optBoolean("excludeFromContext")) {
+                Object content = custom() ? text : message.optBoolean("complete") && !message.optBoolean("archived") ? array(message, "blocks")
                     : new JSONArray().put(json("type", "text", "text", text));
                 protocol.put(json("role", "assistant", "content", content));
             }

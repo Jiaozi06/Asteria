@@ -33,15 +33,18 @@ import java.util.Optional;
 import java.util.List;
 import java.util.Map;
 import java.util.Arrays;
+import java.util.Set;
 import java.util.TreeSet;
 import java.util.concurrent.*;
 import org.json.JSONArray;
+import org.json.JSONException;
 import org.json.JSONObject;
 
 public final class MainActivity extends Activity {
     private static final int SELECT_FILE = 10;
     private static final int RECORD_PERMISSION = 11;
     private static final int CAPTURE_PHOTO = 12;
+    private static final int PICK_HISTORY = 13;
     private static final int CAMERA_GRANT = Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION;
     private static final long MIB = 1024 * 1024;
     private static boolean startedInProcess;
@@ -50,7 +53,7 @@ public final class MainActivity extends Activity {
     private NativeChat screen;
     private FrameLayout root;
     private KeyVault vault;
-    private AtomicFile stateFile;
+    private ConversationStorage history;
     private final Services services = new Services();
     private final RequestLog requestLog = new RequestLog();
     private Recording recording;
@@ -71,7 +74,7 @@ public final class MainActivity extends Activity {
         vault = new KeyVault(this);
         speech = new PhoneSpeech(this, id -> emit("speech", json("id", id)),
             message -> emit("toast", json("message", message)));
-        stateFile = new AtomicFile(new File(getFilesDir(), "conversations.json"));
+        history = new ConversationStorage(new AtomicFile(new File(getFilesDir(), "conversations.json")));
         root = new FrameLayout(this);
         root.getViewTreeObserver().addOnGlobalLayoutListener(() -> {
             if (screen != null) screen.updateInputHint();
@@ -144,6 +147,7 @@ public final class MainActivity extends Activity {
     }
 
     @Override protected void onDestroy() {
+        if (screen != null) screen.closeHistoryProgress();
         speech.shutdown();
         for (DeepSeek.Request request : streams.values()) cancel(request);
         worker.shutdown();
@@ -245,26 +249,41 @@ public final class MainActivity extends Activity {
             });
         }
 
-        String loadState() {
-            synchronized (stateFile) {
-                try { return new String(stateFile.readFully(), StandardCharsets.UTF_8); }
-                catch (IOException ignored) { return "{}"; }
-            }
+        JSONObject loadState() { return history.load(); }
+
+        boolean saveState(JSONObject value) { return history.save(value); }
+
+        void pickHistoryArchive() {
+            Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT).setType("*/*").addCategory(Intent.CATEGORY_OPENABLE);
+            try { startActivityForResult(intent, PICK_HISTORY); }
+            catch (ActivityNotFoundException ignored) { emit("toast", json("message", "系统文件选择器不可用")); }
         }
 
-        boolean saveState(String value) {
-            synchronized (stateFile) {
-                FileOutputStream out = null;
+        void importHistory(URI link, Uri document, Set<String> existing) {
+            worker.execute(() -> {
+                List<JSONObject> chats;
+                String failure;
+                File temp = null;
                 try {
-                    out = stateFile.startWrite();
-                    out.write(value.getBytes(StandardCharsets.UTF_8));
-                    stateFile.finishWrite(out);
-                    return true;
-                } catch (IOException ignored) {
-                    if (out != null) stateFile.failWrite(out);
-                    return false;
+                    temp = File.createTempFile("deepseek-history-", ".zip", getCacheDir());
+                    copyHistoryArchive(link, document, temp);
+                    chats = DeepSeekHistoryImport.read(temp, existing);
+                    failure = "";
+                } catch (DeepSeekHistoryImport.ImportException error) {
+                    chats = null;
+                    failure = error.getMessage();
+                } catch (IOException | JSONException | SecurityException error) {
+                    chats = null;
+                    failure = "无法读取 DeepSeek 导出包，请检查文件或重新获取下载链接。";
+                } finally {
+                    if (temp != null) temp.delete();
                 }
-            }
+                List<JSONObject> imported = chats;
+                String error = failure;
+                runOnUiThread(() -> {
+                    if (!isDestroyed() && !isFinishing()) screen.historyImported(imported, error);
+                });
+            });
         }
 
         boolean hasKey(String endpoint) { return !vault.read(endpoint).isEmpty(); }
@@ -480,6 +499,11 @@ public final class MainActivity extends Activity {
 
     @Override protected void onActivityResult(int request, int result, Intent data) {
         super.onActivityResult(request, result, data);
+        if (request == PICK_HISTORY) {
+            Uri document = result == RESULT_OK && data != null ? data.getData() : null;
+            if (document != null) screen.startHistoryImport(null, document);
+            return;
+        }
         if (request != SELECT_FILE && request != CAPTURE_PHOTO) return;
         String keyId = pendingUploadKey;
         pendingUploadKey = null;
@@ -503,6 +527,30 @@ public final class MainActivity extends Activity {
                 if (photo != null) CapturePhotoProvider.file(this, photo).delete();
             }
         });
+    }
+
+    private void copyHistoryArchive(URI link, Uri document, File target) throws IOException {
+        HttpURLConnection connection = null;
+        try {
+            if (link != null) {
+                connection = (HttpURLConnection) link.toURL().openConnection();
+                connection.setConnectTimeout(15_000);
+                connection.setReadTimeout(30_000);
+                connection.setInstanceFollowRedirects(false);
+                int status = connection.getResponseCode();
+                if (status == 403 || status == 404 || status == 410) {
+                    throw new DeepSeekHistoryImport.ImportException("下载链接已失效或不可访问，请在 DeepSeek 重新导出。");
+                }
+                if (status != 200) throw new IOException("History download failed");
+            }
+            try (InputStream input = connection == null ? getContentResolver().openInputStream(document) : connection.getInputStream();
+                 OutputStream output = new BufferedOutputStream(new FileOutputStream(target))) {
+                if (input == null) throw new IOException("Missing archive stream");
+                DeepSeekHistoryImport.copyArchive(input, output);
+            }
+        } finally {
+            if (connection != null) connection.disconnect();
+        }
     }
 
     private void discardPhoto(Uri photo) {
