@@ -64,8 +64,9 @@ Invoke-Tool "$tool/aapt2.exe" @('compile','--dir',"$main/res",'-o',$res)
 Invoke-Tool "$tool/aapt2.exe" @('link','-o',$unsigned,'-I',$android,'--java',$build,'--manifest',"$main/AndroidManifest.xml",'-A',"$main/assets",$res)
 $sources = @(Get-ChildItem "$main/java" -Recurse -Filter '*.java' | ForEach-Object FullName)
 Invoke-Tool "$JavaHome/bin/javac.exe" (@('-encoding','UTF-8','--release','8','-classpath',((@($android) + $libraries) -join ';'),'-d',$classes) + $sources + "$build/com/jingliu/chat/R.java")
-$bytecode = @(Get-ChildItem $classes -Recurse -Filter '*.class' | ForEach-Object FullName)
-Invoke-Tool "$tool/d8.bat" (@('--lib',$android,'--min-api','26','--output',$build) + $bytecode + $libraries)
+$bytecode = Join-Path $build 'app-classes.jar'
+Invoke-Tool "$JavaHome/bin/jar.exe" @('cf',$bytecode,'-C',$classes,'.')
+Invoke-Tool "$tool/d8.bat" (@('--lib',$android,'--min-api','26','--output',$build,$bytecode) + $libraries)
 $entities = 'org/commonmark/internal/util/entities.txt'
 Push-Location $classes
 try {

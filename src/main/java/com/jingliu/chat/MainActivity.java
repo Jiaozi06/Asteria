@@ -328,13 +328,13 @@ public final class MainActivity extends Activity {
 
         void readNebula(Consumer<MemoryNebula.Snapshot> done) { readNebulaAfter(nebula::snapshot, done); }
 
-        void collectNebula(NebulaSummaries.Target target, List<String> chatIds, AtomicBoolean stop,
+        void collectNebula(NebulaSummaries.Target target, List<String> chatIds, boolean includeLegacy, AtomicBoolean stop,
                 Consumer<MemoryNebula.Progress> progress, BiConsumer<MemoryNebula.Snapshot, String> done) {
             NEBULA_WORKER.execute(() -> {
                 if (closingNebula) return;
                 String status;
                 try {
-                    MemoryNebula.Progress finalProgress = nebula.collect(chatIds, history::messages, target.batchChars(),
+                    MemoryNebula.Progress finalProgress = nebula.collect(chatIds, history::messages, includeLegacy, target.batchChars(),
                         nebulaSummarizer(target), () -> closingNebula || stop.get(),
                         value -> postNebula(() -> progress.accept(value)));
                     status = stop.get() ? "已停止整理" : nebulaResult(finalProgress);

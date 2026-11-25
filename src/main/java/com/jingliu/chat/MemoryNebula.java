@@ -149,7 +149,7 @@ final class MemoryNebula extends SQLiteOpenHelper {
         batch.flush();
     }
 
-    Progress collect(List<String> chatIds, Messages messages, int batchChars, Summarize summarize, BooleanSupplier cancelled,
+    Progress collect(List<String> chatIds, Messages messages, boolean includeLegacy, int batchChars, Summarize summarize, BooleanSupplier cancelled,
             Consumer<Progress> progress) throws Exception {
         Batch batch = new Batch(batchChars, summarize, cancelled, progress, chatIds.size());
         for (String id : chatIds) {
@@ -172,14 +172,16 @@ final class MemoryNebula extends SQLiteOpenHelper {
             batch.scanned++;
             batch.publish(false, false);
         }
-        List<Source> legacy = new ArrayList<>();
-        try (Cursor rows = batch.database.rawQuery("SELECT id, text FROM legacy_notes ORDER BY rowid", null)) {
-            while (rows.moveToNext()) {
-                batch.checkCancelled();
-                legacy.add(new Source(rows.getString(0), filtered(rows.getString(1), batchChars), true));
+        if (includeLegacy) {
+            List<Source> legacy = new ArrayList<>();
+            try (Cursor rows = batch.database.rawQuery("SELECT id, text FROM legacy_notes ORDER BY rowid", null)) {
+                while (rows.moveToNext()) {
+                    batch.checkCancelled();
+                    legacy.add(new Source(rows.getString(0), filtered(rows.getString(1), batchChars), true));
+                }
             }
+            for (Source source : legacy) batch.add(source);
         }
-        for (Source source : legacy) batch.add(source);
         batch.flush();
         return batch.publish(false, true);
     }

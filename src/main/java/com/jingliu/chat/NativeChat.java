@@ -90,6 +90,17 @@ final class NativeChat {
     private static final String PREDICTIVE_BACK = "experimentalPredictiveBack";
     private static final String BLUR_PANELS = "experimentalBlurPanels";
     private enum Motion { NONE, PUSH, POP, FADE }
+    private enum NebulaRange {
+        DAY(1, "最近 1 天"), WEEK(7, "最近 7 天"), MONTH(30, "最近 30 天"), ALL(0, "全部");
+
+        final int days;
+        final String label;
+
+        NebulaRange(int days, String label) {
+            this.days = days;
+            this.label = label;
+        }
+    }
     private static final PathInterpolator EASE = new PathInterpolator(.22f, .75f, .23f, 1f);
     private View screenView;
     private final android.util.SparseArray<Bitmap> backPages = new android.util.SparseArray<>();
@@ -126,7 +137,7 @@ final class NativeChat {
     private HorizontalScrollView nebulaFilterStrip;
     private LinearLayout nebulaFilters, nebulaCards;
     private ProgressBar nebulaProgressBar;
-    private TextView nebulaCount, nebulaRecords, nebulaFeedback, nebulaScan, nebulaClear;
+    private TextView nebulaCount, nebulaFeedback, nebulaScan, nebulaClear;
     private int bg, surface, ink, muted, edge, blue, tint, blueSolid;
     private LinearLayout layout, messages, attachments, tools, attachmentPanel;
     private HorizontalScrollView attachmentStrip;
@@ -2789,19 +2800,6 @@ final class NativeChat {
         bold(nebulaCount);
         summary.addView(nebulaCount, WRAP_CONTENT, WRAP_CONTENT);
         sky.addView(summary, new FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.TOP | Gravity.START));
-        nebulaRecords = action("查看记录 ↓", () -> {
-            Rect area = new Rect();
-            nebulaFilterStrip.getDrawingRect(area);
-            nebulaScroll.offsetDescendantRectToMyCoords(nebulaFilterStrip, area);
-            nebulaScroll.smoothScrollTo(0, Math.max(0, area.top - dp(9)));
-        });
-        nebulaRecords.setTextColor(0xffbdd7ff);
-        nebulaRecords.setTextSize(12);
-        FrameLayout.LayoutParams recordsPosition = new FrameLayout.LayoutParams(WRAP_CONTENT, dp(44),
-            Gravity.BOTTOM | Gravity.END);
-        recordsPosition.setMarginEnd(dp(15));
-        recordsPosition.bottomMargin = dp(5);
-        sky.addView(nebulaRecords, recordsPosition);
         overview.addView(sky, MATCH_PARENT, dp(242));
 
         LinearLayout management = settingsGroup(overview, "整理与管理");
@@ -2822,7 +2820,7 @@ final class NativeChat {
         actions.addView(nebulaScan, new LinearLayout.LayoutParams(0, dp(47), 1));
         actions.addView(nebulaClear, new LinearLayout.LayoutParams(0, dp(47), 1));
         management.addView(actions, MATCH_PARENT, WRAP_CONTENT);
-        settingsNote(overview, "整理时会把你发出的部分文字交给当前配置的 " + state.providerName(state.apiProvider())
+        settingsNote(overview, "整理范围按对话最后更新时间计算。整理时会把你发出的部分文字交给当前配置的 " + state.providerName(state.apiProvider())
             + " API。摘要只保存在本机，与对话记录独立，不参与聊天回复。");
         nebulaProgressBar = new ProgressBar(context, null, android.R.attr.progressBarStyleHorizontal);
         nebulaProgressBar.setProgressTintList(ColorStateList.valueOf(blue));
@@ -2867,7 +2865,6 @@ final class NativeChat {
         if (screen != NEBULA || nebulaSky == null) return;
         nebulaSky.update(nebulaEntries);
         nebulaCount.setText(nebulaEntries.size() + " 条记忆");
-        nebulaRecords.setVisibility(nebulaEntries.isEmpty() ? View.GONE : View.VISIBLE);
         renderNebulaProgress();
         nebulaScan.setText(nebulaStop == null ? "整理已有对话" : nebulaStop.get() ? "正在停止…" : "停止整理");
         enableHistoryButton(nebulaScan, !nebulaWorking || (nebulaStop != null && !nebulaStop.get()));
@@ -2897,7 +2894,7 @@ final class NativeChat {
     private void renderNebulaProgress() {
         if (screen != NEBULA || nebulaProgressBar == null) return;
         MemoryNebula.Progress state = nebulaProgressState;
-        String feedback = nebulaStatus.isEmpty() && nebulaHasLegacy ? "有旧星云记录等待重新总结" : nebulaStatus;
+        String feedback = nebulaStatus.isEmpty() && nebulaHasLegacy ? "可选择「全部」重新整理旧星云记录" : nebulaStatus;
         nebulaProgressBar.setVisibility(state == null ? View.GONE : View.VISIBLE);
         if (state != null) {
             boolean running = nebulaStop != null;
@@ -2980,9 +2977,7 @@ final class NativeChat {
             return;
         }
         if (nebulaWorking) return;
-        List<String> ids = new ArrayList<>();
-        for (JSONObject chat : state.history("", Collections.emptySet())) ids.add(string(chat, "id"));
-        if (ids.isEmpty() && !nebulaHasLegacy) {
+        if (state.chats().length() == 0 && !nebulaHasLegacy) {
             toast("还没有可整理的对话");
             return;
         }
@@ -2991,12 +2986,56 @@ final class NativeChat {
             toast("请先在设置里配置模型和 API");
             return;
         }
+        NebulaRange[] ranges = NebulaRange.values();
+        String[] labels = new String[ranges.length];
+        for (int i = 0; i < ranges.length; i++) labels[i] = ranges[i].label;
+        choiceSheet("整理范围", labels, -1, selected -> chooseNebulaRange(ranges[selected], target));
+    }
+
+    private void chooseNebulaRange(NebulaRange range, NebulaSummaries.Target target) {
+        if (screen != NEBULA || nebulaWorking) return;
+        boolean all = range == NebulaRange.ALL;
+        long now = System.currentTimeMillis();
+        long cutoff = now - java.util.concurrent.TimeUnit.DAYS.toMillis(range.days);
+        List<String> ids = new ArrayList<>();
+        for (JSONObject chat : state.history("", Collections.emptySet())) {
+            long updated = chat.optLong("updated");
+            if (all || (updated >= cutoff && updated <= now)) ids.add(string(chat, "id"));
+        }
+        boolean includeLegacy = all && nebulaHasLegacy;
+        if (ids.isEmpty() && !includeLegacy) {
+            toast("这个范围内没有可整理的对话");
+            return;
+        }
+        if (range != NebulaRange.MONTH && !all) {
+            startNebulaCollection(target, ids, false);
+            return;
+        }
+        Dialog dialog = newSheet();
+        LinearLayout panel = settingsSheet(dialog, "确认整理" + (all ? "全部历史" : range.label) + "？");
+        String count = ids.isEmpty() ? "本次只整理旧星云记录。" : "范围内有 " + ids.size() + " 个对话。";
+        if (!ids.isEmpty() && includeLegacy) count += "旧星云记录也会纳入。";
+        settingsNote(panel, count);
+        TextView warning = text("大范围整理可能消耗大量 Token，并产生 API 费用。已整理过的消息会跳过。", 14,
+            dark ? 0xffffd89a : 0xff754607);
+        pad(warning, 13, 11);
+        warning.setBackground(box(dark ? 0xff352b20 : 0xfffff3df, 0, 12));
+        panel.addView(warning, MATCH_PARENT, WRAP_CONTENT);
+        sheetActions(panel, "取消", dialog::dismiss, "确认整理", () -> {
+            dialog.dismiss();
+            startNebulaCollection(target, ids, includeLegacy);
+        });
+        showSheet(dialog, panel);
+    }
+
+    private void startNebulaCollection(NebulaSummaries.Target target, List<String> ids, boolean includeLegacy) {
+        if (screen != NEBULA || nebulaWorking) return;
         nebulaWorking = true;
         nebulaStop = new AtomicBoolean();
         nebulaProgressState = new MemoryNebula.Progress(0, ids.size(), 0, 0, 0, 0, false);
         nebulaStatus = "正在读取历史…";
         renderNebula();
-        services.collectNebula(target, ids, nebulaStop, progress -> {
+        services.collectNebula(target, ids, includeLegacy, nebulaStop, progress -> {
             nebulaProgressState = progress;
             if (!nebulaStop.get()) nebulaStatus = "";
             renderNebulaProgress();
