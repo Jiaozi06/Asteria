@@ -73,7 +73,7 @@ try {
 } finally {
     Pop-Location
 }
-Invoke-Tool "$JavaHome/bin/jar.exe" @('uf',$unsigned,'-C',$build,'classes.dex','-C',$classes,$entities)
+Invoke-Tool "$JavaHome/bin/jar.exe" @('uf',$unsigned,'-C',$build,'classes.dex','-C',$classes,$entities,'-C',$PSScriptRoot,'LICENSE')
 Invoke-Tool "$tool/zipalign.exe" @('-P','16','-f','4',$unsigned,$aligned)
 
 if (!(Test-Path $SigningStore)) {

@@ -6,6 +6,9 @@ import android.content.*;
 import android.content.pm.PackageManager;
 import android.content.res.Configuration;
 import android.database.Cursor;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.graphics.ImageDecoder;
 import android.graphics.Rect;
 import android.media.*;
 import android.net.Uri;
@@ -14,6 +17,7 @@ import android.os.Bundle;
 import android.speech.RecognitionListener;
 import android.speech.RecognizerIntent;
 import android.speech.SpeechRecognizer;
+import android.provider.MediaStore;
 import android.provider.OpenableColumns;
 import android.util.AtomicFile;
 import android.view.*;
@@ -37,6 +41,8 @@ import org.json.JSONObject;
 public final class MainActivity extends Activity {
     private static final int SELECT_FILE = 10;
     private static final int RECORD_PERMISSION = 11;
+    private static final int CAPTURE_PHOTO = 12;
+    private static final int CAMERA_GRANT = Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION;
     private static final long MIB = 1024 * 1024;
     private static boolean startedInProcess;
     private final ExecutorService worker = Executors.newCachedThreadPool();
@@ -48,7 +54,8 @@ public final class MainActivity extends Activity {
     private final Services services = new Services();
     private final RequestLog requestLog = new RequestLog();
     private Recording recording;
-    private String pendingUploadKey = "";
+    private String pendingUploadKey;
+    private Uri pendingPhoto;
     private SpeechRecognizer dictation;
     private boolean voicePermissionSystem, voicePermissionHold;
     private PhoneSpeech speech;
@@ -78,9 +85,25 @@ public final class MainActivity extends Activity {
             });
         }
         setContentView(root);
-        screen = new NativeChat(this, root, services, !startedInProcess);
+        boolean coldStart = !startedInProcess;
+        if (saved != null) {
+            Uri photo = saved.getParcelable("pendingPhoto");
+            if (coldStart) discardPhoto(photo);
+            else {
+                pendingPhoto = photo;
+                pendingUploadKey = saved.getString("pendingUploadKey");
+            }
+        }
+        screen = new NativeChat(this, root, services, coldStart);
+        if (pendingUploadKey != null) screen.attachmentPickerPending();
         startedInProcess = true;
         screen.show();
+    }
+
+    @Override protected void onSaveInstanceState(Bundle state) {
+        super.onSaveInstanceState(state);
+        state.putParcelable("pendingPhoto", pendingPhoto);
+        state.putString("pendingUploadKey", pendingUploadKey);
     }
 
     @Override public void onConfigurationChanged(Configuration config) {
@@ -319,6 +342,12 @@ public final class MainActivity extends Activity {
             });
         }
 
+        boolean voiceInputMode() { return getPreferences(MODE_PRIVATE).getBoolean("voiceInputMode", false); }
+
+        void saveVoiceInputMode(boolean enabled) {
+            getPreferences(MODE_PRIVATE).edit().putBoolean("voiceInputMode", enabled).apply();
+        }
+
         boolean requestLoggingEnabled() {
             return getPreferences(MODE_PRIVATE).getBoolean("requestLoggingEnabled", false);
         }
@@ -362,13 +391,37 @@ public final class MainActivity extends Activity {
         void cancel(int id) { MainActivity.this.cancel(streams.get(id)); }
 
         void pickFile(boolean imagesOnly, String keyId) {
-            runOnUiThread(() -> {
-                pendingUploadKey = keyId == null ? "" : keyId;
-                Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT)
-                    .setType(imagesOnly ? "image/*" : "*/*").addCategory(Intent.CATEGORY_OPENABLE);
-                try { startActivityForResult(intent, SELECT_FILE); }
-                catch (ActivityNotFoundException ignored) { emit("upload", json("error", "系统文件选择器不可用。")); }
-            });
+            pendingUploadKey = keyId == null ? "" : keyId;
+            if (imagesOnly && Build.VERSION.SDK_INT >= 33) {
+                try {
+                    startActivityForResult(new Intent(MediaStore.ACTION_PICK_IMAGES).setType("image/*"), SELECT_FILE);
+                    return;
+                } catch (ActivityNotFoundException ignored) { }
+            }
+            Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT)
+                .setType(imagesOnly ? "image/*" : "*/*").addCategory(Intent.CATEGORY_OPENABLE);
+            try { startActivityForResult(intent, SELECT_FILE); }
+            catch (ActivityNotFoundException error) {
+                pendingUploadKey = null;
+                emit("upload", json("error", "系统文件选择器不可用。"));
+            }
+        }
+
+        void takePhoto(String keyId) {
+            pendingUploadKey = keyId == null ? "" : keyId;
+            try {
+                pendingPhoto = CapturePhotoProvider.create(MainActivity.this);
+                Intent intent = new Intent(MediaStore.ACTION_IMAGE_CAPTURE)
+                    .putExtra(MediaStore.EXTRA_OUTPUT, pendingPhoto)
+                    .addFlags(CAMERA_GRANT);
+                intent.setClipData(ClipData.newRawUri("相机输出", pendingPhoto));
+                startActivityForResult(intent, CAPTURE_PHOTO);
+            } catch (IOException | ActivityNotFoundException | SecurityException error) {
+                discardPhoto(pendingPhoto);
+                pendingPhoto = null;
+                pendingUploadKey = null;
+                emit("upload", json("error", "无法打开系统相机。"));
+            }
         }
 
         boolean beginVoice(boolean system, boolean hold) { return startVoice(system, hold); }
@@ -427,12 +480,35 @@ public final class MainActivity extends Activity {
 
     @Override protected void onActivityResult(int request, int result, Intent data) {
         super.onActivityResult(request, result, data);
-        if (request != SELECT_FILE) return;
+        if (request != SELECT_FILE && request != CAPTURE_PHOTO) return;
         String keyId = pendingUploadKey;
-        pendingUploadKey = "";
-        if (result != RESULT_OK || data == null || data.getData() == null) { emit("upload", json()); return; }
-        Uri uri = data.getData();
-        worker.execute(() -> upload(uri, keyId));
+        pendingUploadKey = null;
+        Uri photo = request == CAPTURE_PHOTO ? pendingPhoto : null;
+        pendingPhoto = null;
+        Uri uri = request == CAPTURE_PHOTO ? photo : data == null ? null : data.getData();
+        if (result != RESULT_OK || uri == null || keyId == null) {
+            discardPhoto(photo);
+            emit("upload", json());
+            return;
+        }
+        if (photo != null && CapturePhotoProvider.file(this, photo).length() == 0) {
+            discardPhoto(photo);
+            emit("upload", json("error", "没有收到拍摄的照片。"));
+            return;
+        }
+        if (photo != null) revokeUriPermission(photo, CAMERA_GRANT);
+        worker.execute(() -> {
+            try { upload(uri, keyId); }
+            finally {
+                if (photo != null) CapturePhotoProvider.file(this, photo).delete();
+            }
+        });
+    }
+
+    private void discardPhoto(Uri photo) {
+        if (photo == null) return;
+        revokeUriPermission(photo, CAMERA_GRANT);
+        CapturePhotoProvider.file(this, photo).delete();
     }
 
     private void upload(Uri uri, String keyId) {
@@ -454,6 +530,11 @@ public final class MainActivity extends Activity {
             boolean parsed = !image && lower.matches(".*\\.(pdf|doc|docx|ppt|pptx|bmp|tif|tiff)$");
             long limit = image ? 64 * MIB : parsed ? 100 * MIB : 32 * MIB;
             if (size > limit) throw new DeepSeek.ApiError("文件超过 " + limit / MIB + " MiB。");
+            Bitmap thumbnail = image ? attachmentThumbnail(uri) : null;
+            String displayName = name;
+            runOnUiThread(() -> {
+                if (!isDestroyed()) screen.attachmentPreview(displayName, image, thumbnail);
+            });
             try (InputStream input = getContentResolver().openInputStream(uri)) {
                 if (input == null) throw new IOException();
                 KeyVault.Credential attachment = vault.forAttachment("", keyId);
@@ -469,6 +550,37 @@ public final class MainActivity extends Activity {
             emit("upload", json("error", key.isEmpty() ? message : message.replace(key, "••••")));
         }
         finally { request.close(); }
+    }
+
+    private Bitmap attachmentThumbnail(Uri uri) {
+        final int maxSize = 320;
+        try {
+            if (Build.VERSION.SDK_INT >= 28) {
+                return ImageDecoder.decodeBitmap(ImageDecoder.createSource(getContentResolver(), uri),
+                    (decoder, info, source) -> {
+                        int width = info.getSize().getWidth(), height = info.getSize().getHeight();
+                        int longest = Math.max(width, height);
+                        if (longest > maxSize) {
+                            float ratio = (float) maxSize / longest;
+                            decoder.setTargetSize(Math.max(1, Math.round(width * ratio)), Math.max(1, Math.round(height * ratio)));
+                        }
+                    });
+            }
+            BitmapFactory.Options options = new BitmapFactory.Options();
+            options.inJustDecodeBounds = true;
+            try (InputStream input = getContentResolver().openInputStream(uri)) {
+                BitmapFactory.decodeStream(input, null, options);
+            }
+            options.inJustDecodeBounds = false;
+            options.inSampleSize = 1;
+            int longest = Math.max(options.outWidth, options.outHeight);
+            while (longest / options.inSampleSize > maxSize) options.inSampleSize *= 2;
+            try (InputStream input = getContentResolver().openInputStream(uri)) {
+                return BitmapFactory.decodeStream(input, null, options);
+            }
+        } catch (IOException | RuntimeException ignored) {
+            return null;
+        }
     }
 
     private boolean startVoice(boolean system, boolean hold) {

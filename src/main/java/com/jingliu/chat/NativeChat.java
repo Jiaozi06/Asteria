@@ -6,6 +6,7 @@ import android.app.Dialog;
 import android.content.Context;
 import android.content.pm.PackageManager;
 import android.content.res.ColorStateList;
+import android.graphics.Bitmap;
 import android.graphics.Rect;
 import android.graphics.Typeface;
 import android.graphics.drawable.ColorDrawable;
@@ -86,7 +87,13 @@ final class NativeChat {
     private ListView historyList;
     private HistoryAdapter historyAdapter;
     private int bg, surface, ink, muted, edge, blue, tint, blueSolid;
-    private LinearLayout layout, messages, attachments, tools;
+    private LinearLayout layout, messages, attachments, tools, attachmentPanel;
+    private HorizontalScrollView attachmentStrip;
+    private TextView attachmentStatus;
+    private JSONObject pendingAttachment;
+    private Bitmap pendingThumbnail;
+    private final android.util.LruCache<String, Bitmap> attachmentThumbnails = new android.util.LruCache<>(24);
+    private boolean attachmentPanelOpen;
     private LinearLayout chatFooter, editHeader;
     private View editShade;
     private EditSession editing;
@@ -135,6 +142,7 @@ final class NativeChat {
         this.root = root;
         this.services = services;
         state = new ChatState(services.loadState());
+        voiceMode = services.voiceInputMode();
         if (coldStart && state.current() != null) {
             state.activate(null);
             save();
@@ -173,6 +181,8 @@ final class NativeChat {
         }
         show(Motion.NONE, screen == CHAT && drawer != null && drawer.isRevealed());
     }
+
+    void attachmentPickerPending() { upload = true; }
 
     void show() { show(Motion.NONE, false); }
 
@@ -290,10 +300,14 @@ final class NativeChat {
             else drawer.close();
             return true;
         }
+        if (attachmentPanelOpen) {
+            setAttachmentPanel(false, true);
+            return true;
+        }
         if (editing != null) { closeEdit(); return true; }
         if (voiceMode) {
             if (recording || transcribing) services.endVoice(true);
-            voiceMode = false;
+            useVoiceInput(false);
             controls();
             return true;
         }
@@ -503,8 +517,15 @@ final class NativeChat {
         editHeader.addView(editTitle, new LinearLayout.LayoutParams(0, MATCH_PARENT, 1));
         editHeader.addView(icon(R.drawable.ic_close, "取消修改", this::closeEdit), dp(43), dp(42));
         composer.addView(editHeader, MATCH_PARENT, dp(42));
-        attachments = vertical();
-        composer.addView(attachments, MATCH_PARENT, WRAP_CONTENT);
+        attachmentStrip = new HorizontalScrollView(context);
+        attachmentStrip.setHorizontalScrollBarEnabled(false);
+        attachments = horizontal();
+        pad(attachments, 3, 4);
+        attachmentStrip.addView(attachments, WRAP_CONTENT, WRAP_CONTENT);
+        composer.addView(attachmentStrip, MATCH_PARENT, WRAP_CONTENT);
+        attachmentStatus = text("正在上传附件…", 13, blue);
+        pad(attachmentStatus, 6, 3);
+        composer.addView(attachmentStatus, MATCH_PARENT, WRAP_CONTENT);
         input = new EditText(context);
         ChatFont.apply(input, 16, ChatFont.scale(state.data));
         input.setTextColor(ink);
@@ -519,7 +540,10 @@ final class NativeChat {
         pad(input, 8, 9);
         input.setText(draft);
         input.setSelection(input.length());
-        input.setOnFocusChangeListener((view, focused) -> updateInputHint());
+        input.setOnFocusChangeListener((view, focused) -> {
+            if (focused) setAttachmentPanel(false, true);
+            updateInputHint();
+        });
         input.setOnTouchListener((view, event) -> voiceTouch(view, event, false));
         composer.addView(input, MATCH_PARENT, WRAP_CONTENT);
         voicePad = action("按住说话", () -> {
@@ -545,7 +569,8 @@ final class NativeChat {
         add = icon(R.drawable.ic_attach, "添加附件", this::showAttachments);
         mic = icon(R.drawable.ic_mic, "切换到语音输入", () -> {
             if (recording || transcribing) return;
-            voiceMode = !voiceMode;
+            setAttachmentPanel(false, true);
+            useVoiceInput(!voiceMode);
             input.clearFocus();
             services.hideKeyboard();
             controls();
@@ -554,6 +579,13 @@ final class NativeChat {
         tools.addView(add, dp(42), dp(44));
         tools.addView(mic, dp(42), dp(44));
         tools.addView(send, dp(42), dp(42));
+        attachmentPanel = horizontal();
+        pad(attachmentPanel, 1, 7);
+        attachmentAction("拍照", R.drawable.ic_camera, () -> selectAttachment(services::takePhoto));
+        attachmentAction("相册", R.drawable.ic_photo, () -> selectAttachment(key -> services.pickFile(true, key)));
+        attachmentAction("文件", R.drawable.ic_paperclip, () -> selectAttachment(key -> services.pickFile(false, key)));
+        footer.addView(attachmentPanel, MATCH_PARENT, WRAP_CONTENT);
+        setAttachmentPanel(attachmentPanelOpen, false);
         TextView note = text("回答由 AI 生成，仅供参考", 11, dark ? 0xff9299a3 : 0xff697486);
         note.setGravity(Gravity.CENTER);
         footer.addView(note, MATCH_PARENT, WRAP_CONTENT);
@@ -607,6 +639,7 @@ final class NativeChat {
 
     private boolean startVoice(boolean hold) {
         if (busy() || (!state.custom() && !requireKey())) return false;
+        setAttachmentPanel(false, true);
         return services.beginVoice(state.custom(), hold);
     }
 
@@ -666,7 +699,7 @@ final class NativeChat {
                 voiceOverlay.setVisibility(View.GONE);
                 voiceHalo.stop();
                 chatFooter.setAlpha(1f);
-                if (!cancelled) voiceMode = true;
+                if (!cancelled) useVoiceInput(true);
                 services.endVoice(cancelled);
                 if (!cancelled && !heldVoiceText.isEmpty()) applyVoiceText(heldVoiceText);
                 heldVoiceText = "";
@@ -697,8 +730,14 @@ final class NativeChat {
         if (holdingVoice && voiceHalo != null) voiceHalo.setLevel(level);
     }
 
+    private void useVoiceInput(boolean enabled) {
+        if (voiceMode == enabled) return;
+        voiceMode = enabled;
+        services.saveVoiceInputMode(enabled);
+    }
+
     private void applyVoiceText(String text) {
-        voiceMode = false;
+        useVoiceInput(false);
         draft = draft.trim().isEmpty() ? text : draft.trim() + " " + text;
         if (screen == CHAT) {
             input.setText(draft);
@@ -737,22 +776,80 @@ final class NativeChat {
         send.setContentDescription(generating ? "停止生成" : modifying ? "重新发送" : "发送消息");
         send.setImageTintList(ColorStateList.valueOf(dark ? 0xff0f1725 : 0xffffffff));
         buttonBackground(send, blueSolid, 0, 13);
+        renderAttachments();
+    }
+
+    void attachmentPreview(String name, boolean image, Bitmap thumbnail) {
+        pendingAttachment = json("name", name, "image", image);
+        pendingThumbnail = thumbnail;
+        controls();
+    }
+
+    private void renderAttachments() {
+        boolean visible = !state.attachments.isEmpty() || pendingAttachment != null;
+        attachmentStrip.setVisibility(visible ? View.VISIBLE : View.GONE);
+        attachmentStatus.setVisibility(upload ? View.VISIBLE : View.GONE);
         attachments.removeAllViews();
         for (JSONObject attachment : state.attachments) {
-            TextView file = action("附件 · " + attachment.optString("name") + "  ×", () -> {
-                if (!busy()) { state.attachments.remove(attachment); controls(); }
-            });
-            file.setSingleLine();
-            file.setEllipsize(TextUtils.TruncateAt.END);
-            file.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
-            attachments.addView(file, MATCH_PARENT, WRAP_CONTENT);
+            renderAttachment(attachment, attachmentThumbnails.get(string(attachment, "id")), false);
         }
-        String inProgress = upload ? "正在上传附件…" : "";
-        if (!inProgress.isEmpty()) {
-            TextView label = text(inProgress, 13, blue);
-            pad(label, 9, 3);
-            attachments.addView(label);
+        if (pendingAttachment != null) renderAttachment(pendingAttachment, pendingThumbnail, true);
+    }
+
+    private void renderAttachment(JSONObject attachment, Bitmap thumbnail, boolean pending) {
+        String name = attachment.optString("name");
+        boolean image = attachment.optBoolean("image");
+        FrameLayout tile = new FrameLayout(context);
+        tile.setBackground(box(tint, edge, 12));
+        tile.setClipToOutline(true);
+
+        LinearLayout.LayoutParams size = new LinearLayout.LayoutParams(dp(image ? 78 : 164), dp(image ? 78 : 56));
+        if (attachments.getChildCount() > 0) size.setMarginStart(dp(7));
+        attachments.addView(tile, size);
+        if (image) {
+            ImageView preview = new ImageView(context);
+            preview.setContentDescription("图片预览：" + name);
+            if (thumbnail != null) {
+                preview.setImageBitmap(thumbnail);
+                preview.setScaleType(ImageView.ScaleType.CENTER_CROP);
+            } else {
+                preview.setImageResource(R.drawable.ic_photo);
+                preview.setImageTintList(ColorStateList.valueOf(blue));
+                preview.setScaleType(ImageView.ScaleType.CENTER);
+            }
+            tile.addView(preview, new FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT));
+        } else {
+            LinearLayout detail = horizontal();
+            pad(detail, 8, 0);
+            detail.setPaddingRelative(dp(8), 0, dp(pending ? 8 : 34), 0);
+            ImageView mark = new ImageView(context);
+            mark.setImageResource(R.drawable.ic_request_log);
+            mark.setImageTintList(ColorStateList.valueOf(blue));
+            detail.addView(mark, dp(24), dp(24));
+            TextView title = text(name, 13, ink);
+            title.setPaddingRelative(dp(5), 0, 0, 0);
+            title.setSingleLine();
+            title.setEllipsize(TextUtils.TruncateAt.MIDDLE);
+            detail.addView(title, new LinearLayout.LayoutParams(0, MATCH_PARENT, 1));
+            tile.addView(detail, new FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT));
         }
+        if (pending) return;
+        ImageButton remove = icon(R.drawable.ic_close, "移除附件：" + name, () -> {
+            if (!busy()) {
+                state.attachments.remove(attachment);
+                attachmentThumbnails.remove(string(attachment, "id"));
+                controls();
+            }
+        });
+        if (image) {
+            remove.setImageTintList(ColorStateList.valueOf(0xffffffff));
+            buttonBackground(remove, 0xb02a3040, 0, 14);
+        }
+        FrameLayout.LayoutParams close = new FrameLayout.LayoutParams(dp(34), dp(34),
+            Gravity.END | (image ? Gravity.TOP : Gravity.CENTER_VERTICAL));
+        close.setMarginEnd(dp(3));
+        if (image) close.topMargin = dp(3);
+        tile.addView(remove, close);
     }
 
     private void updateChatHeader() {
@@ -768,18 +865,63 @@ final class NativeChat {
         chatModel.setVisibility(model.isEmpty() ? View.GONE : View.VISIBLE);
     }
 
+    private void attachmentAction(String title, int drawable, Runnable run) {
+        LinearLayout tile = vertical();
+        tile.setGravity(Gravity.CENTER);
+        buttonBackground(tile, surface, edge, 16);
+        tile.setFocusable(true);
+        tile.setContentDescription(title);
+        tile.setOnClickListener(view -> run.run());
+
+        ImageView symbol = new ImageView(context);
+        symbol.setImageResource(drawable);
+        symbol.setImageTintList(ColorStateList.valueOf(blue));
+        symbol.setBackground(box(tint, 0, 12));
+        symbol.setScaleType(ImageView.ScaleType.CENTER);
+        tile.addView(symbol, dp(36), dp(34));
+        TextView label = text(title, 13, ink);
+        label.setGravity(Gravity.CENTER);
+        tile.addView(label, MATCH_PARENT, dp(25));
+
+        LinearLayout.LayoutParams size = new LinearLayout.LayoutParams(0, dp(76), 1);
+        if (attachmentPanel.getChildCount() > 0) size.setMarginStart(dp(7));
+        attachmentPanel.addView(tile, size);
+    }
+
     private void showAttachments() {
+        if (busy()) return;
+        if (!attachmentPanelOpen) {
+            input.clearFocus();
+            services.hideKeyboard();
+        }
+        setAttachmentPanel(!attachmentPanelOpen, true);
+    }
+
+    private void setAttachmentPanel(boolean open, boolean animate) {
+        boolean changed = attachmentPanelOpen != open;
+        boolean follow = changed && screen == CHAT && nearBottom();
+        if (changed && animate && ValueAnimator.areAnimatorsEnabled()) {
+            TransitionSet transition = new TransitionSet().addTransition(new Fade()).addTransition(new ChangeBounds());
+            transition.setDuration(180).setInterpolator(EASE);
+            TransitionManager.beginDelayedTransition(chatFooter, transition);
+        }
+        attachmentPanelOpen = open;
+        attachmentPanel.setVisibility(open ? View.VISIBLE : View.GONE);
+        add.setImageResource(open ? R.drawable.ic_close : R.drawable.ic_attach);
+        add.setContentDescription(open ? "收起附件选项" : "添加附件");
+        if (follow) bottom();
+    }
+
+    private void selectAttachment(java.util.function.Consumer<String> launch) {
+        setAttachmentPanel(false, true);
         if (state.custom()) {
             composerNotice("添加附件", "当前的图片和文档上传使用 DeepSeek 官方接口。", "API 设置", this::openApiSettings);
             return;
         }
-        if (!requireKey()) return;
-        new AlertDialog.Builder(context).setTitle("添加附件").setItems(new String[]{"选取照片", "选取文件"}, (dialog, index) -> {
-            voiceMode = false;
-            upload = true;
-            controls();
-            services.pickFile(index == 0, state.attachmentKey());
-        }).show();
+        if (busy() || !allowProvider() || !requireKey()) return;
+        upload = true;
+        controls();
+        launch.accept(state.attachmentKey());
     }
 
     private void composerNotice(String title, String explanation, String actionLabel, Runnable open) {
@@ -819,9 +961,9 @@ final class NativeChat {
     }
 
     private void clearChatView() {
+        setAttachmentPanel(false, false);
         services.stopSpeaking();
         editing = null;
-        voiceMode = false;
         draft = "";
         unfolded.clear();
         input.setText("");
@@ -848,6 +990,7 @@ final class NativeChat {
         if (busy() || !requireKey() || !allowProvider()) return;
         String message = draft.trim();
         if (message.isEmpty() && state.attachments.isEmpty()) return;
+        setAttachmentPanel(false, true);
         JSONArray files = new JSONArray();
         for (JSONObject file : state.attachments) files.put(file);
         EditSession session = editing;
@@ -868,6 +1011,7 @@ final class NativeChat {
 
     private void beginEdit(JSONObject message, int index) {
         if (!mayChange() || !requireKey() || !allowProvider()) return;
+        setAttachmentPanel(false, true);
         services.hideKeyboard();
         input.clearFocus();
         editing = new EditSession(index, draft, state.attachments,
@@ -1604,6 +1748,7 @@ final class NativeChat {
     }
 
     private void onHistoryOpening() {
+        setAttachmentPanel(false, false);
         services.hideKeyboard();
         refreshHistory();
     }
@@ -2094,7 +2239,7 @@ final class NativeChat {
             brand.addView(versionLabel, MATCH_PARENT, WRAP_CONTENT);
         }
         gap(brand, 11);
-        TextView description = text("开源原生 Android 聊天客户端，支持 DeepSeek 和 OpenAI 兼容接口。", 14, muted);
+        TextView description = text("原生 Android 聊天客户端，支持 DeepSeek 和 OpenAI 兼容接口。", 14, muted);
         description.setGravity(Gravity.CENTER);
         pad(description, 16, 0);
         brand.addView(description, MATCH_PARENT, WRAP_CONTENT);
@@ -2107,7 +2252,8 @@ final class NativeChat {
         divider(project);
         settingsRow(project, R.drawable.ic_edit, "问题反馈", "", () -> services.open(AppUpdate.PROJECT_URL + "/issues"));
         divider(project);
-        settingsRow(project, R.drawable.ic_request_log, "开源许可证", "MIT", () -> services.open(AppUpdate.PROJECT_URL + "/blob/main/LICENSE"));
+        settingsRow(project, R.drawable.ic_request_log, "项目许可证", "非商业用途",
+            () -> services.open("https://polyformproject.org/licenses/noncommercial/1.0.0"));
     }
 
     void updateAvailable(java.util.Optional<AppUpdate.Release> result, boolean requested) {
@@ -3213,7 +3359,12 @@ final class NativeChat {
             case "upload":
                 upload = false;
                 if (event.has("error")) toast(string(event, "error"));
-                else if (event.has("id")) state.attachments.add(event);
+                else if (event.has("id")) {
+                    if (pendingThumbnail != null) attachmentThumbnails.put(event.optString("id"), pendingThumbnail);
+                    state.attachments.add(event);
+                }
+                pendingAttachment = null;
+                pendingThumbnail = null;
                 controls();
                 break;
             case "voice":
