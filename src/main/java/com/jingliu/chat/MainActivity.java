@@ -6,6 +6,7 @@ import android.content.*;
 import android.content.pm.PackageManager;
 import android.content.res.Configuration;
 import android.database.Cursor;
+import android.database.sqlite.SQLiteException;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.ImageDecoder;
@@ -19,10 +20,11 @@ import android.speech.RecognizerIntent;
 import android.speech.SpeechRecognizer;
 import android.provider.MediaStore;
 import android.provider.OpenableColumns;
-import android.util.AtomicFile;
 import android.view.*;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.FrameLayout;
+import android.widget.ProgressBar;
+import android.widget.Button;
 import java.io.*;
 import java.net.*;
 import java.nio.ByteBuffer;
@@ -36,6 +38,7 @@ import java.util.Arrays;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.concurrent.*;
+import java.util.function.Consumer;
 import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
@@ -63,10 +66,11 @@ public final class MainActivity extends Activity {
     private boolean voicePermissionSystem, voicePermissionHold;
     private PhoneSpeech speech;
     private boolean checkingUpdate, manualUpdate;
+    private Runnable pendingActivityResult;
 
     @Override protected void onStart() {
         super.onStart();
-        services.checkUpdate(false);
+        if (screen != null) services.checkUpdate(false);
     }
 
     @Override public void onCreate(Bundle saved) {
@@ -74,7 +78,7 @@ public final class MainActivity extends Activity {
         vault = new KeyVault(this);
         speech = new PhoneSpeech(this, id -> emit("speech", json("id", id)),
             message -> emit("toast", json("message", message)));
-        history = new ConversationStorage(new AtomicFile(new File(getFilesDir(), "conversations.json")));
+        history = new ConversationStorage(getFilesDir());
         root = new FrameLayout(this);
         root.getViewTreeObserver().addOnGlobalLayoutListener(() -> {
             if (screen != null) screen.updateInputHint();
@@ -97,10 +101,38 @@ public final class MainActivity extends Activity {
                 pendingUploadKey = saved.getString("pendingUploadKey");
             }
         }
-        screen = new NativeChat(this, root, services, coldStart);
-        if (pendingUploadKey != null) screen.attachmentPickerPending();
-        startedInProcess = true;
-        screen.show();
+        loadConversationScreen(coldStart);
+    }
+
+    private void loadConversationScreen(boolean coldStart) {
+        root.removeAllViews();
+        root.addView(new ProgressBar(this), new FrameLayout.LayoutParams(-2, -2, Gravity.CENTER));
+        worker.execute(() -> {
+            JSONObject loaded;
+            try { loaded = history.load(); }
+            catch (IOException | JSONException | SQLiteException | IllegalStateException error) { loaded = null; }
+            JSONObject data = loaded;
+            runOnUiThread(() -> {
+                if (isDestroyed() || isFinishing()) return;
+                root.removeAllViews();
+                if (data == null) {
+                    Button retry = new Button(this);
+                    retry.setText("对话加载失败，点击重试");
+                    retry.setOnClickListener(view -> loadConversationScreen(coldStart));
+                    root.addView(retry, new FrameLayout.LayoutParams(-2, -2, Gravity.CENTER));
+                    return;
+                }
+                screen = new NativeChat(this, root, services, data, coldStart);
+                if (pendingUploadKey != null) screen.attachmentPickerPending();
+                startedInProcess = true;
+                screen.show();
+                if (pendingActivityResult != null) {
+                    pendingActivityResult.run();
+                    pendingActivityResult = null;
+                }
+                services.checkUpdate(false);
+            });
+        });
     }
 
     @Override protected void onSaveInstanceState(Bundle state) {
@@ -111,7 +143,7 @@ public final class MainActivity extends Activity {
 
     @Override public void onConfigurationChanged(Configuration config) {
         super.onConfigurationChanged(config);
-        screen.refreshTheme();
+        if (screen != null) screen.refreshTheme();
     }
 
     boolean systemDark() {
@@ -133,7 +165,7 @@ public final class MainActivity extends Activity {
     }
 
     @Override public void onBackPressed() {
-        if (!screen.back()) super.onBackPressed();
+        if (screen == null || !screen.back()) super.onBackPressed();
     }
 
     @Override protected void onStop() {
@@ -150,6 +182,7 @@ public final class MainActivity extends Activity {
         if (screen != null) screen.closeHistoryProgress();
         speech.shutdown();
         for (DeepSeek.Request request : streams.values()) cancel(request);
+        worker.execute(history::close);
         worker.shutdown();
         super.onDestroy();
     }
@@ -160,7 +193,7 @@ public final class MainActivity extends Activity {
 
     private void emit(String type, JSONObject data) {
         runOnUiThread(() -> {
-            if (!isDestroyed()) screen.event(type, data);
+            if (!isDestroyed() && screen != null) screen.event(type, data);
         });
     }
 
@@ -249,9 +282,22 @@ public final class MainActivity extends Activity {
             });
         }
 
-        JSONObject loadState() { return history.load(); }
+        boolean saveState(JSONObject value, boolean saveActiveMessages) { return history.save(value, saveActiveMessages); }
 
-        boolean saveState(JSONObject value) { return history.save(value); }
+        JSONArray loadMessages(String id) {
+            try { return history.messages(id); }
+            catch (JSONException | SQLiteException error) { return null; }
+        }
+
+        void searchHistory(String query, Consumer<Set<String>> done) {
+            worker.execute(() -> {
+                Set<String> hits;
+                try { hits = history.containing(query); }
+                catch (SQLiteException | IllegalStateException error) { hits = java.util.Collections.emptySet(); }
+                Set<String> result = hits;
+                runOnUiThread(() -> { if (!isDestroyed()) done.accept(result); });
+            });
+        }
 
         void pickHistoryArchive() {
             Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT).setType("*/*").addCategory(Intent.CATEGORY_OPENABLE);
@@ -267,11 +313,14 @@ public final class MainActivity extends Activity {
                 try {
                     temp = File.createTempFile("deepseek-history-", ".zip", getCacheDir());
                     copyHistoryArchive(link, document, temp);
-                    chats = DeepSeekHistoryImport.read(temp, existing);
+                    chats = history.importChats(DeepSeekHistoryImport.read(temp, existing));
                     failure = "";
                 } catch (DeepSeekHistoryImport.ImportException error) {
                     chats = null;
                     failure = error.getMessage();
+                } catch (SQLiteException error) {
+                    chats = null;
+                    failure = "本地记录写入失败，导入已取消。";
                 } catch (IOException | JSONException | SecurityException error) {
                     chats = null;
                     failure = "无法读取 DeepSeek 导出包，请检查文件或重新获取下载链接。";
@@ -499,6 +548,11 @@ public final class MainActivity extends Activity {
 
     @Override protected void onActivityResult(int request, int result, Intent data) {
         super.onActivityResult(request, result, data);
+        if (screen == null) pendingActivityResult = () -> handleActivityResult(request, result, data);
+        else handleActivityResult(request, result, data);
+    }
+
+    private void handleActivityResult(int request, int result, Intent data) {
         if (request == PICK_HISTORY) {
             Uri document = result == RESULT_OK && data != null ? data.getData() : null;
             if (document != null) screen.startHistoryImport(null, document);

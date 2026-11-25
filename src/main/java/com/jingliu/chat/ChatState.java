@@ -109,7 +109,12 @@ final class ChatState {
     JSONArray chats() { return array(data, "chats"); }
     JSONObject current() {
         String active = string(data, "active");
-        for (JSONObject chat : objects(chats())) if (active.equals(chat.optString("id"))) return chat;
+        if (active.isEmpty()) return null;
+        JSONArray chats = chats();
+        for (int i = 0; i < chats.length(); i++) {
+            JSONObject chat = chats.optJSONObject(i);
+            if (chat != null && active.equals(chat.optString("id"))) return chat;
+        }
         return null;
     }
     JSONArray messages() { return array(current(), "messages"); }
@@ -234,16 +239,6 @@ final class ChatState {
         attachments.clear();
     }
 
-    boolean delete(Set<String> ids) {
-        boolean clearActive = ids.contains(string(data, "active"));
-        JSONArray entries = chats();
-        for (int i = entries.length() - 1; i >= 0; i--) {
-            if (ids.contains(string(entries.optJSONObject(i), "id"))) entries.remove(i);
-        }
-        if (clearActive) activate(null);
-        return clearActive;
-    }
-
     static boolean pinned(JSONObject chat) { return chat.optLong("pinnedAt") > 0; }
 
     void setPinned(Set<String> ids, boolean value) {
@@ -255,21 +250,14 @@ final class ChatState {
         }
     }
 
-    List<JSONObject> history(String filter) {
+    List<JSONObject> history(String filter, Set<String> bodyMatches) {
         String query = filter.trim().toLowerCase(Locale.ROOT);
         List<JSONObject> result = objects(chats());
-        if (!query.isEmpty()) result.removeIf(chat -> !matches(chat, query));
+        if (!query.isEmpty()) result.removeIf(chat -> !bodyMatches.contains(string(chat, "id"))
+            && !string(chat, "title").toLowerCase(Locale.ROOT).contains(query));
         result.sort(Comparator.comparingLong((JSONObject chat) -> chat.optLong("pinnedAt"))
             .thenComparingLong(chat -> chat.optLong("updated")).reversed());
         return result;
-    }
-
-    private boolean matches(JSONObject chat, String query) {
-        if (string(chat, "title").toLowerCase(Locale.ROOT).contains(query)) return true;
-        for (JSONObject message : objects(array(chat, "messages"))) {
-            if (answer(message).toLowerCase(Locale.ROOT).contains(query)) return true;
-        }
-        return false;
     }
 
     static String answer(JSONObject message) {

@@ -22,6 +22,7 @@ import android.transition.TransitionManager;
 import android.transition.TransitionSet;
 import android.view.ContextThemeWrapper;
 import android.view.Gravity;
+import android.view.HapticFeedbackConstants;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewConfiguration;
@@ -40,6 +41,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import org.json.JSONArray;
@@ -61,6 +63,7 @@ final class NativeChat {
     private String offeredUpdate = "";
     private Context context;
     private boolean dark, hasKey, upload, recording, transcribing, renderPending, checking;
+    private boolean messagesDirty;
     private boolean voiceMode, holdingVoice;
     private View voiceTouchTarget;
     private Runnable voiceHoldStart;
@@ -83,11 +86,14 @@ final class NativeChat {
     private Dialog historyImportProgress;
     private int settingsReturnScroll = -1;
     private String historyFilter = "";
+    private Set<String> historyBodyMatches = Collections.emptySet();
+    private int historySearchRequest;
+    private Runnable historySearchTask;
     private final Set<String> selectedChats = new HashSet<>();
     private LinearLayout historyPanel, historyBrowse, historyManage, historyShortcuts, historySelection;
     private EditText historySearch;
     private TextView historyCount, historyPin, historyDelete, historyEmpty;
-    private ListView historyList;
+    private HistorySelectionList historyList;
     private HistoryAdapter historyAdapter;
     private int bg, surface, ink, muted, edge, blue, tint, blueSolid;
     private LinearLayout layout, messages, attachments, tools, attachmentPanel;
@@ -140,15 +146,17 @@ final class NativeChat {
         }
     }
 
-    NativeChat(MainActivity host, FrameLayout root, MainActivity.Services services, boolean coldStart) {
+    NativeChat(MainActivity host, FrameLayout root, MainActivity.Services services, JSONObject stored, boolean coldStart) {
         this.host = host;
         this.root = root;
         this.services = services;
-        state = new ChatState(services.loadState());
+        state = new ChatState(stored);
         voiceMode = services.voiceInputMode();
         if (coldStart && state.current() != null) {
             state.activate(null);
             save();
+        } else if (state.current() != null && !loadConversation(state.current())) {
+            state.activate(null);
         }
         updateKey();
     }
@@ -257,7 +265,21 @@ final class NativeChat {
     }
 
     private void save() {
-        if (!services.saveState(state.data)) toast("本地记录写入失败。");
+        persist();
+    }
+
+    private boolean persist() {
+        if (services.saveState(state.data, messagesDirty)) {
+            messagesDirty = false;
+            return true;
+        }
+        toast("本地记录写入失败。");
+        return false;
+    }
+
+    private void saveMessages() {
+        messagesDirty = true;
+        save();
     }
 
     boolean back() {
@@ -957,12 +979,32 @@ final class NativeChat {
             return;
         }
         if (!mayChange()) return;
+        if (!prepareConversationSwitch(chat)) return;
         state.activate(chat);
         clearChatView();
         save();
         services.hideKeyboard();
         if (drawer.isRevealed()) drawer.close();
         else animateChatContents();
+    }
+
+    private boolean loadConversation(JSONObject chat) {
+        if (chat.optJSONArray("messages") != null) return true;
+        JSONArray messages = services.loadMessages(string(chat, "id"));
+        if (messages == null) {
+            toast("无法读取这条对话。");
+            return false;
+        }
+        put(chat, "messages", messages);
+        return true;
+    }
+
+    private boolean prepareConversationSwitch(JSONObject next) {
+        if (messagesDirty && !persist()) return false;
+        if (next != null && !loadConversation(next)) return false;
+        JSONObject previous = state.current();
+        if (previous != null) previous.remove("messages");
+        return true;
     }
 
     private void clearChatView() {
@@ -1078,6 +1120,7 @@ final class NativeChat {
         new AlertDialog.Builder(context).setTitle("此会话使用另一接口")
             .setMessage("可切换回原接口继续会话，或使用当前接口新建对话。")
             .setPositiveButton("新对话", (d, w) -> {
+                if (!mayChange() || !prepareConversationSwitch(null)) return;
                 String pending = draft;
                 state.activate(null);
                 clearChatView();
@@ -1091,7 +1134,7 @@ final class NativeChat {
     private void generate(JSONObject user, int index) {
         services.stopSpeaking();
         ChatState.Job job = state.start(user, index);
-        save();
+        saveMessages();
         put(job.reply, "status", "正在连接…");
         renderMessages(true);
         controls();
@@ -1102,7 +1145,7 @@ final class NativeChat {
     private void finish(ChatState.Job completed, String error) {
         state.finish(error);
         unfolded.remove(completed.reply);
-        save();
+        saveMessages();
         if (screen == CHAT) {
             boolean follow = nearBottom();
             if (ValueAnimator.areAnimatorsEnabled() && liveReply != null && !answer(liveReply).isEmpty()) {
@@ -1547,8 +1590,8 @@ final class NativeChat {
             heading = horizontal();
             heading.setMinimumHeight(dp(37));
             heading.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
-            buttonBackground(heading, 0, 0, 9);
-            addView(heading, MATCH_PARENT, WRAP_CONTENT);
+            heading.setFocusable(true);
+            addView(heading, WRAP_CONTENT, WRAP_CONTENT);
             caption = text("", 14, muted);
             ChatFont.apply(caption, 14, ChatFont.scale(state.data));
             heading.addView(caption, WRAP_CONTENT, MATCH_PARENT);
@@ -1674,7 +1717,7 @@ final class NativeChat {
 
         FrameLayout listArea = new FrameLayout(context);
         historyPanel.addView(listArea, new LinearLayout.LayoutParams(MATCH_PARENT, 0, 1));
-        historyList = new ListView(context);
+        historyList = new HistorySelectionList();
         historyList.setDivider(new ColorDrawable(0));
         historyList.setDividerHeight(dp(3));
         historyList.setItemsCanFocus(true);
@@ -1730,6 +1773,7 @@ final class NativeChat {
 
         watch(historySearch, value -> {
             historyFilter = value;
+            queueHistorySearch();
             refreshHistory();
             historyList.setSelection(0);
         });
@@ -1762,6 +1806,7 @@ final class NativeChat {
 
     private void onHistoryClosed() {
         if (historyPanel == null) return;
+        historyList.endSelectionGesture();
         historySearch.clearFocus();
         services.hideKeyboard();
         managingHistory = false;
@@ -1780,6 +1825,7 @@ final class NativeChat {
 
     private void setHistoryMode(boolean manage) {
         if (managingHistory == manage) return;
+        historyList.endSelectionGesture();
         services.hideKeyboard();
         historySearch.clearFocus();
         if (ValueAnimator.areAnimatorsEnabled()) {
@@ -1797,8 +1843,23 @@ final class NativeChat {
         updateHistorySelection();
     }
 
+    private void queueHistorySearch() {
+        int request = ++historySearchRequest;
+        if (historySearchTask != null) root.removeCallbacks(historySearchTask);
+        historyBodyMatches = Collections.emptySet();
+        String query = historyFilter.trim().toLowerCase(Locale.ROOT);
+        if (query.isEmpty()) return;
+        historySearchTask = () -> services.searchHistory(query, hits -> {
+            if (request != historySearchRequest || screen != CHAT) return;
+            historyBodyMatches = hits;
+            refreshHistory();
+        });
+        root.postDelayed(historySearchTask, 180);
+    }
+
     private void refreshHistory() {
-        List<JSONObject> chats = state.history(historyFilter);
+        historyList.endSelectionGesture();
+        List<JSONObject> chats = state.history(historyFilter, historyBodyMatches);
         List<HistoryItem> rows = new ArrayList<>();
         String previous = "";
         ZoneId zone = ZoneId.systemDefault();
@@ -1874,22 +1935,73 @@ final class NativeChat {
 
     private void confirmDelete(Set<String> ids) {
         if (ids.isEmpty() || !mayChange()) return;
+        confirmHistoryDeletion(ids, "删除 " + ids.size() + " 条对话？", "删除后无法恢复。", "删除");
+    }
+
+    private void confirmClearHistory() {
+        if (!mayChange()) return;
+        Set<String> ids = new HashSet<>();
+        for (JSONObject chat : objects(state.chats())) ids.add(string(chat, "id"));
+        if (ids.isEmpty()) {
+            toast("对话列表已为空");
+            return;
+        }
+        confirmHistoryDeletion(ids, "清空全部对话？", "将删除本机全部 " + ids.size() + " 条对话，包括置顶和导入的对话。删除后无法恢复。", "清空全部");
+    }
+
+    private void confirmHistoryDeletion(Set<String> ids, String title, String message, String label) {
         Dialog dialog = newSheet();
-        LinearLayout panel = settingsSheet(dialog, "删除 " + ids.size() + " 条对话？");
-        TextView warning = text("删除后无法恢复。", 14, muted);
+        LinearLayout panel = settingsSheet(dialog, title);
+        TextView warning = text(message, 14, muted);
         pad(warning, 6, 14);
         panel.addView(warning, MATCH_PARENT, WRAP_CONTENT);
-        TextView erase = sheetActions(panel, "取消", dialog::dismiss, "删除", () -> {
+        TextView erase = sheetActions(panel, "取消", dialog::dismiss, label, () -> {
             dialog.dismiss();
             if (!mayChange()) return;
-            if (state.delete(ids)) clearChatView();
-            save();
-            if (managingHistory) setHistoryMode(false);
-            refreshHistory();
+            deleteHistory(ids);
         });
         erase.setTextColor(dangerColor());
         buttonBackground(erase, surface, dangerColor(), 14);
         showSheet(dialog, panel);
+    }
+
+    private void deleteHistory(Set<String> ids) {
+        JSONArray previous = state.chats();
+        JSONArray remaining = new JSONArray();
+        for (JSONObject chat : objects(previous)) if (!ids.contains(string(chat, "id"))) remaining.put(chat);
+        Object oldActive = state.data.opt("active");
+        boolean clearActive = ids.contains(string(state.data, "active"));
+        boolean wasDirty = messagesDirty;
+        put(state.data, "chats", remaining);
+        if (clearActive) {
+            put(state.data, "active", JSONObject.NULL);
+            messagesDirty = false;
+        }
+        if (!persist()) {
+            put(state.data, "chats", previous);
+            put(state.data, "active", oldActive);
+            messagesDirty = wasDirty;
+            return;
+        }
+        if (clearActive) {
+            state.activate(null);
+            if (screen == CHAT) clearChatView();
+            else {
+                draft = "";
+                unfolded.clear();
+                settingsReturnScroll = -1;
+                services.stopSpeaking();
+            }
+        }
+        if (screen == CHAT) {
+            if (managingHistory) setHistoryMode(false);
+            refreshHistory();
+        } else {
+            selectedChats.clear();
+            historyFilter = "";
+            historyBodyMatches = Collections.emptySet();
+            toast("已清空全部对话");
+        }
     }
 
     private void historyActions(View anchor, JSONObject chat) {
@@ -1987,7 +2099,151 @@ final class NativeChat {
         }
     }
 
+    private final class HistorySelectionList extends ListView {
+        private final int touchSlop = ViewConfiguration.get(context).getScaledTouchSlop();
+        private final Runnable startDrag = this::beginSelectionDrag;
+        private final Runnable autoScroll = this::scrollSelection;
+        private Set<String> originalSelection;
+        private int anchor = INVALID_POSITION, endpoint, pointer = -1;
+        private boolean selecting, moved;
+        private long downTime;
+        private float downX, downY, fingerY;
+
+        HistorySelectionList() { super(context); }
+
+        @Override public boolean dispatchTouchEvent(MotionEvent event) {
+            int action = event.getActionMasked();
+            if (originalSelection != null) {
+                int index = event.findPointerIndex(pointer);
+                if (action == MotionEvent.ACTION_MOVE && index >= 0) {
+                    fingerY = event.getY(index);
+                    moved |= Math.abs(fingerY - downY) > touchSlop;
+                    if (moved) {
+                        extendSelection();
+                        scheduleSelectionScroll();
+                    }
+                } else if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) endSelectionGesture();
+                else if (action == MotionEvent.ACTION_POINTER_UP && event.getPointerId(event.getActionIndex()) == pointer) {
+                    pointer = -1;
+                    removeCallbacks(autoScroll);
+                }
+                return true;
+            }
+            if (action == MotionEvent.ACTION_DOWN) {
+                endSelectionGesture();
+                if (managingHistory) {
+                    downX = event.getX();
+                    downY = event.getY();
+                    anchor = pointToPosition((int) downX, (int) downY);
+                    if (selectionKey(anchor) != null) {
+                        downTime = event.getDownTime();
+                        pointer = event.getPointerId(0);
+                        postDelayed(startDrag, ViewConfiguration.getLongPressTimeout());
+                    }
+                }
+            } else if (action != MotionEvent.ACTION_MOVE || Math.abs(event.getX() - downX) > touchSlop
+                    || Math.abs(event.getY() - downY) > touchSlop) {
+                removeCallbacks(startDrag);
+            }
+            return super.dispatchTouchEvent(event);
+        }
+
+        private void beginSelectionDrag() {
+            String id = selectionKey(anchor);
+            if (!managingHistory || !isShown() || id == null) return;
+            MotionEvent cancel = MotionEvent.obtain(downTime, android.os.SystemClock.uptimeMillis(),
+                MotionEvent.ACTION_CANCEL, downX, downY, 0);
+            super.dispatchTouchEvent(cancel);
+            cancel.recycle();
+            requestDisallowInterceptTouchEvent(true);
+            originalSelection = new HashSet<>(selectedChats);
+            endpoint = anchor;
+            selecting = !originalSelection.contains(id);
+            if (selecting) selectedChats.add(id);
+            else selectedChats.remove(id);
+            fingerY = downY;
+            moved = false;
+            performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
+            updateVisibleHistoryChecks();
+        }
+
+        private void extendSelection() {
+            if (getChildCount() == 0) return;
+            int child = 0;
+            while (child < getChildCount() - 1 && fingerY >= getChildAt(child).getBottom()) child++;
+            int next = getFirstVisiblePosition() + child;
+            if (next == endpoint) return;
+            boolean changed = false;
+            int first = Math.min(anchor, next), last = Math.max(anchor, next);
+            for (int row = Math.min(endpoint, next); row <= Math.max(endpoint, next); row++) {
+                String id = selectionKey(row);
+                if (id == null) continue;
+                boolean check = row >= first && row <= last ? selecting : originalSelection.contains(id);
+                changed |= check ? selectedChats.add(id) : selectedChats.remove(id);
+            }
+            endpoint = next;
+            if (changed) updateVisibleHistoryChecks();
+        }
+
+        private int selectionScrollStep() {
+            int edge = Math.min(dp(52), getHeight() / 4);
+            if (edge == 0) return 0;
+            float proximity = fingerY < edge ? fingerY - edge : Math.max(0f, fingerY - (getHeight() - edge));
+            return Math.round(Math.max(-1f, Math.min(1f, proximity / edge)) * dp(14));
+        }
+
+        private void scheduleSelectionScroll() {
+            removeCallbacks(autoScroll);
+            int step = selectionScrollStep();
+            if (step != 0 && canScrollList(Integer.signum(step))) postOnAnimation(autoScroll);
+        }
+
+        private void scrollSelection() {
+            if (originalSelection == null) return;
+            scrollListBy(selectionScrollStep());
+            extendSelection();
+            scheduleSelectionScroll();
+        }
+
+        void endSelectionGesture() {
+            removeCallbacks(startDrag);
+            removeCallbacks(autoScroll);
+            if (originalSelection != null) requestDisallowInterceptTouchEvent(false);
+            originalSelection = null;
+            anchor = INVALID_POSITION;
+            pointer = -1;
+        }
+
+        @Override protected void onDetachedFromWindow() {
+            endSelectionGesture();
+            super.onDetachedFromWindow();
+        }
+    }
+
+    private String selectionKey(int position) {
+        if (position < 0 || position >= historyAdapter.getCount()) return null;
+        JSONObject chat = historyAdapter.getItem(position).chat;
+        return chat == null ? null : string(chat, "id");
+    }
+
+    private void updateVisibleHistoryChecks() {
+        int first = historyList.getFirstVisiblePosition();
+        for (int i = 0; i < historyList.getChildCount(); i++) {
+            ImageView check = historyList.getChildAt(i).findViewWithTag(HistoryAdapter.CHECK);
+            if (check != null) showHistoryCheck(check, selectedChats.contains(selectionKey(first + i)));
+        }
+        updateHistorySelection();
+    }
+
+    private void showHistoryCheck(ImageView check, boolean selected) {
+        if (check.getBackground() != null && check.isSelected() == selected) return;
+        check.setSelected(selected);
+        check.setBackground(box(selected ? blueSolid : 0, selected ? 0 : muted, 11));
+        check.setImageResource(selected ? R.drawable.ic_check : 0);
+    }
+
     private final class HistoryAdapter extends BaseAdapter {
+        static final String CHECK = "history_checkbox";
         List<JSONObject> chats = Collections.emptyList();
         List<HistoryItem> rows = Collections.emptyList();
 
@@ -2029,14 +2285,12 @@ final class NativeChat {
                 else activate(chat);
             });
             if (managingHistory) {
-                boolean selected = selectedChats.contains(string(chat, "id"));
+                String id = string(chat, "id");
                 ImageView check = new ImageView(context);
-                check.setBackground(box(selected ? blueSolid : 0, selected ? 0 : muted, 11));
-                if (selected) {
-                    check.setImageResource(R.drawable.ic_check);
-                    check.setImageTintList(ColorStateList.valueOf(dark ? 0xff101623 : 0xffffffff));
-                    pad(check, 3, 3);
-                }
+                check.setTag(CHECK);
+                check.setImageTintList(ColorStateList.valueOf(dark ? 0xff101623 : 0xffffffff));
+                pad(check, 3, 3);
+                showHistoryCheck(check, selectedChats.contains(id));
                 LinearLayout.LayoutParams dot = new LinearLayout.LayoutParams(dp(21), dp(21));
                 dot.setMarginStart(dp(8));
                 dot.setMarginEnd(dp(11));
@@ -2046,7 +2300,7 @@ final class NativeChat {
                     @Override public void onInitializeAccessibilityNodeInfo(View host, android.view.accessibility.AccessibilityNodeInfo info) {
                         super.onInitializeAccessibilityNodeInfo(host, info);
                         info.setCheckable(true);
-                        info.setChecked(selected);
+                        info.setChecked(selectedChats.contains(id));
                     }
                 });
             } else row.setOnLongClickListener(view -> {
@@ -2147,6 +2401,8 @@ final class NativeChat {
         divider(connection);
         settingsRow(connection, R.drawable.ic_import_history, "导入 DeepSeek 对话", "", this::showHistoryImport);
         divider(connection);
+        settingsRow(connection, R.drawable.ic_trash, "清空全部对话", "", this::confirmClearHistory);
+        divider(connection);
         LinearLayout compressionRow = settingsLine(connection, R.drawable.ic_compress);
         Switch compression = new Switch(context);
         compression.setText("自动压缩上下文");
@@ -2242,6 +2498,10 @@ final class NativeChat {
 
     void startHistoryImport(URI link, Uri document) {
         if (!mayChange()) return;
+        if (checking) {
+            toast("当前 API 设置保存完成后即可导入。");
+            return;
+        }
         Set<String> existing = new HashSet<>();
         for (JSONObject chat : objects(state.chats())) existing.add(string(chat, "id"));
         historyImportProgress = new AlertDialog.Builder(context)
@@ -2268,16 +2528,7 @@ final class NativeChat {
             toast("没有可新增的对话");
             return;
         }
-        JSONArray previous = state.chats();
-        JSONArray merged = new JSONArray();
-        for (int i = 0; i < previous.length(); i++) merged.put(previous.opt(i));
-        for (JSONObject chat : imported) merged.put(chat);
-        put(state.data, "chats", merged);
-        if (!services.saveState(state.data)) {
-            put(state.data, "chats", previous);
-            toast("本地记录写入失败，导入已取消");
-            return;
-        }
+        for (JSONObject chat : imported) state.chats().put(chat);
         if (screen == CHAT) refreshHistory();
         toast("已导入 " + imported.size() + " 条对话");
     }
