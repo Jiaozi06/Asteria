@@ -578,7 +578,9 @@ final class NativeChat {
         send = icon(R.drawable.ic_send, "发送消息", this::submit);
         tools.addView(add, dp(42), dp(44));
         tools.addView(mic, dp(42), dp(44));
-        tools.addView(send, dp(42), dp(42));
+        LinearLayout.LayoutParams sendSize = new LinearLayout.LayoutParams(dp(42), dp(42));
+        sendSize.setMarginStart(dp(6));
+        tools.addView(send, sendSize);
         attachmentPanel = horizontal();
         pad(attachmentPanel, 1, 7);
         attachmentAction("拍照", R.drawable.ic_camera, () -> selectAttachment(services::takePhoto));
