@@ -69,7 +69,9 @@ final class NativeChat {
     private String providerNameDraft, pendingProviderName, keyManagementEndpoint;
     private int screen;
     private JSONObject editedOptionsChat;
-    private static final int CHAT = 0, SETTINGS = 1, API_SETTINGS = 2, FONT_SETTINGS = 3, MODEL_SETTINGS = 4, KEY_SETTINGS = 5, ABOUT = 6;
+    private EditText instructionEditor;
+    private String instructionDraft = "";
+    private static final int CHAT = 0, SETTINGS = 1, API_SETTINGS = 2, FONT_SETTINGS = 3, MODEL_SETTINGS = 4, KEY_SETTINGS = 5, ABOUT = 6, INSTRUCTION_SETTINGS = 7;
     private enum Motion { NONE, PUSH, POP, FADE }
     private static final PathInterpolator EASE = new PathInterpolator(.22f, .75f, .23f, 1f);
     private View screenView;
@@ -128,11 +130,15 @@ final class NativeChat {
         }
     }
 
-    NativeChat(MainActivity host, FrameLayout root, MainActivity.Services services) {
+    NativeChat(MainActivity host, FrameLayout root, MainActivity.Services services, boolean coldStart) {
         this.host = host;
         this.root = root;
         this.services = services;
         state = new ChatState(services.loadState());
+        if (coldStart && state.current() != null) {
+            state.activate(null);
+            save();
+        }
         updateKey();
     }
 
@@ -158,6 +164,9 @@ final class NativeChat {
     }
 
     void refreshTheme() {
+        if (screen == INSTRUCTION_SETTINGS && instructionEditor != null) {
+            instructionDraft = instructionEditor.getText().toString();
+        }
         if (screen == API_SETTINGS) {
             captureEndpointFields();
             keyDraft = apiKey.getText().toString();
@@ -208,6 +217,7 @@ final class NativeChat {
             else if (screen == FONT_SETTINGS) buildFontSettings();
             else if (screen == MODEL_SETTINGS) buildModelSettings();
             else if (screen == ABOUT) buildAbout();
+            else if (screen == INSTRUCTION_SETTINGS) buildInstructionSettings();
             else buildSettingsHome();
             screenView = layout;
         }
@@ -245,6 +255,10 @@ final class NativeChat {
                 keyManagementEndpoint = null;
                 show(Motion.POP, false);
                 queueModelLookup();
+                return true;
+            }
+            if (screen == INSTRUCTION_SETTINGS) {
+                closeInstructionSettings();
                 return true;
             }
             if (screen == MODEL_SETTINGS) {
@@ -2181,8 +2195,12 @@ final class NativeChat {
         modelChoice(style, "回复语气", "tone",
             new String[]{"默认", "亲切", "共情", "专业", "直接", "轻松幽默"},
             new String[]{"", "friendly", "empathetic", "professional", "direct", "playful"});
-        modelText(style, "自定义指令", "instructions", "可填写希望模型长期遵循的语言、语气或回复规则。填写后会替换 DeepSeek 的默认提示词。",
-            "例如：用简体中文回答，先给结论", 4000);
+        addModelOption(style, "自定义指令", () -> string(editedModelOptions(), "instructions").isEmpty() ? "默认" : "已设置",
+            update -> {
+                instructionDraft = string(editedModelOptions(), "instructions");
+                screen = INSTRUCTION_SETTINGS;
+                show(Motion.PUSH, false);
+            });
 
         LinearLayout output = settingsGroup(body, "输出与推理");
         modelNumber(output, "最大输出 Token", "outputLimit", "限制单次生成的 Token 数。上游模型可能有更低的限制。",
@@ -2313,11 +2331,43 @@ final class NativeChat {
         });
     }
 
-    private void modelText(LinearLayout group, String title, String key, String help, String hint, int maxLength) {
-        modelInput(group, title, key, help, hint, InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE, raw -> {
-            if (raw.length() > maxLength) throw new IllegalArgumentException("最多 " + maxLength + " 个字符");
-            return raw;
+    private void closeInstructionSettings() {
+        instructionEditor = null;
+        instructionDraft = "";
+        screen = MODEL_SETTINGS;
+        show(Motion.POP, false);
+    }
+
+    private void buildInstructionSettings() {
+        header("自定义指令", R.drawable.ic_back, "返回", this::back, false);
+        LinearLayout body = vertical();
+        pad(body, 16, 5);
+        layout.addView(body, MATCH_PARENT, WRAP_CONTENT);
+        settingsNote(body, "填写希望模型遵循的指令。填写后会替换 DeepSeek 的默认提示词。");
+
+        instructionEditor = field("例如：用简体中文回答，先给结论", false);
+        instructionEditor.setContentDescription("自定义指令");
+        instructionEditor.setSingleLine(false);
+        instructionEditor.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE);
+        instructionEditor.setGravity(Gravity.TOP | Gravity.START);
+        instructionEditor.setVerticalScrollBarEnabled(true);
+        instructionEditor.setImeOptions(android.view.inputmethod.EditorInfo.IME_FLAG_NO_EXTRACT_UI);
+        instructionEditor.setText(instructionDraft);
+        instructionEditor.setSelection(instructionEditor.length());
+        int viewport = root.getHeight() - root.getPaddingTop() - root.getPaddingBottom();
+        int height = Math.round(viewport * .75f);
+        body.addView(instructionEditor, new LinearLayout.LayoutParams(MATCH_PARENT, height, 1));
+        sheetActions(body, "恢复默认", () -> {
+            storeModelOption("instructions", null);
+            services.hideKeyboard();
+            closeInstructionSettings();
+        }, "保存", () -> {
+            String entered = instructionEditor.getText().toString().trim();
+            storeModelOption("instructions", entered.isEmpty() ? null : entered);
+            services.hideKeyboard();
+            closeInstructionSettings();
         });
+        layout.requestFocus();
     }
 
     private void modelInput(LinearLayout group, String title, String key, String help, String hint, int type,

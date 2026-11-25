@@ -38,6 +38,7 @@ public final class MainActivity extends Activity {
     private static final int SELECT_FILE = 10;
     private static final int RECORD_PERMISSION = 11;
     private static final long MIB = 1024 * 1024;
+    private static boolean startedInProcess;
     private final ExecutorService worker = Executors.newCachedThreadPool();
     private final Map<Integer, DeepSeek.Request> streams = new ConcurrentHashMap<>();
     private NativeChat screen;
@@ -77,7 +78,8 @@ public final class MainActivity extends Activity {
             });
         }
         setContentView(root);
-        screen = new NativeChat(this, root, services);
+        screen = new NativeChat(this, root, services, !startedInProcess);
+        startedInProcess = true;
         screen.show();
     }
 
