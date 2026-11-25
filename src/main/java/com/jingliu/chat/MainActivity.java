@@ -393,21 +393,20 @@ public final class MainActivity extends Activity {
             catch (Exception error) { return "无法移除已保存的密钥"; }
         }
 
-        void discoverModels(int id, ApiProvider provider, String endpoint, String candidate) {
+        void discoverModels(int id, ApiProvider provider, String endpoint, ApiProtocol protocol, String candidate) {
             worker.execute(() -> {
                 DeepSeek.Request request = apiRequest(provider);
                 try {
                     String key = candidate.isEmpty() ? vault.read(endpoint) : candidate;
-                    HttpURLConnection connection = endpoint.isEmpty() ? request.open("/models", "GET", key)
-                        : request.custom(endpoint, "/models", "GET", key);
+                    HttpURLConnection connection = protocol.models(request, endpoint, key);
                     connection.setConnectTimeout(10_000);
                     connection.setReadTimeout(15_000);
-                    JSONArray models = DeepSeek.json(connection).getJSONArray("data");
+                    JSONArray models = protocol.modelList(DeepSeek.json(connection));
                     TreeSet<String> items = new TreeSet<>();
                     for (int i = 0; i < models.length() && items.size() < 2000; i++) {
                         JSONObject model = models.optJSONObject(i);
                         if (model == null) continue;
-                        String name = model.optString("id").trim();
+                        String name = protocol.modelId(model).trim();
                         if (!name.isEmpty() && name.length() <= 240) items.add(name);
                     }
                     emit("models", json("id", id, "items", new JSONArray(items)));
@@ -418,23 +417,23 @@ public final class MainActivity extends Activity {
             });
         }
 
-        void verify(ApiProvider provider, String endpoint, String model, String candidate, boolean test) {
+        void verify(ApiProvider provider, String endpoint, ApiProtocol protocol, String model, String candidate, boolean test) {
             worker.execute(() -> {
                 DeepSeek.Request request = apiRequest(provider);
                 String key = candidate.isEmpty() ? vault.read(endpoint) : candidate;
                 try {
                     if (ApiProvider.requiresKey(endpoint) && key.isEmpty()) throw new DeepSeek.ApiError("请先填写 API Key。");
-                    if (test && ApiProvider.requiresKey(endpoint)) {
-                        HttpURLConnection connection = endpoint.isEmpty() ? request.open("/models", "GET", key)
-                            : request.custom(endpoint, "/models", "GET", key);
+                    if (test && (ApiProvider.requiresKey(endpoint) || protocol == ApiProtocol.OLLAMA)) {
+                        HttpURLConnection connection = protocol.models(request, endpoint, key);
                         connection.setReadTimeout(25_000);
-                        DeepSeek.json(connection).getJSONArray("data");
+                        protocol.modelList(DeepSeek.json(connection));
                     } else if (test) {
-                        HttpURLConnection connection = request.custom(endpoint, "/chat/completions", "POST", key);
+                        HttpURLConnection connection = protocol.chat(request, endpoint, key, model, false);
                         connection.setReadTimeout(30_000);
-                        DeepSeek.jsonBody(connection, json("model", model, "max_tokens", 1, "stream", false,
-                            "messages", new org.json.JSONArray().put(json("role", "user", "content", "Hi"))).toString());
-                        DeepSeek.json(connection).getJSONArray("choices");
+                        JSONObject probe = json("model", model, "max_tokens", 1, "stream", false,
+                            "messages", new JSONArray().put(json("role", "user", "content", "Hi")));
+                        DeepSeek.jsonBody(connection, protocol.encode(probe, endpoint, 0, false).toString());
+                        if (!protocol.validProbe(DeepSeek.json(connection))) throw new DeepSeek.ApiError("接口返回的格式与所选协议不符。");
                     }
                     if (!candidate.isEmpty()) vault.save(endpoint, key);
                     String message = !test ? "接口配置已保存" : key.isEmpty() ? "连接成功，接口配置已保存" : "连接成功，API Key 已保存";
@@ -463,7 +462,8 @@ public final class MainActivity extends Activity {
 
         List<RequestLog.Entry> requestLogs(String chatId) { return requestLog.forChat(chatId); }
 
-        void stream(int id, String chatId, ApiProvider provider, String endpoint, String body, boolean compactContext, String attachmentKey) {
+        void stream(int id, String chatId, ApiProvider provider, String endpoint, ApiProtocol protocol, String body,
+                boolean compactContext, int contextWindow, boolean thinking, String attachmentKey) {
             DeepSeek.Request request = apiRequest(provider);
             RequestLog.Entry trace = requestLoggingEnabled() ? requestLog.start(chatId, provider.label) : null;
             request.trace = trace;
@@ -478,7 +478,8 @@ public final class MainActivity extends Activity {
                         key = attachment.value;
                     }
                     if (ApiProvider.requiresKey(endpoint) && key.isEmpty()) throw new DeepSeek.ApiError("请先配置当前接口的 API Key。");
-                    DeepSeek.stream(request, endpoint, key, body, compactContext, event -> emit("stream", json("id", id, "event", event)));
+                    DeepSeek.stream(request, endpoint, protocol, key, body, compactContext, contextWindow, thinking,
+                        event -> emit("stream", json("id", id, "event", event)));
                     if (trace != null) trace.finish(request.cancelled(), "", key);
                     emit("streamEnd", json("id", id));
                 } catch (Exception e) {

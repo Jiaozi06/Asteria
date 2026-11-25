@@ -29,6 +29,8 @@ final class ChatState {
     static final class Job {
         final int id;
         final String endpoint;
+        final ApiProtocol protocol;
+        final int contextWindow;
         final JSONObject chat;
         final JSONObject reply;
         final JSONObject request;
@@ -39,9 +41,12 @@ final class ChatState {
         boolean hasReasoning;
         boolean thinkingFinished;
 
-        Job(int id, String endpoint, JSONObject chat, JSONObject reply, JSONObject request, String attachmentKey) {
+        Job(int id, String endpoint, ApiProtocol protocol, int contextWindow, JSONObject chat, JSONObject reply,
+                JSONObject request, String attachmentKey) {
             this.id = id;
             this.endpoint = endpoint;
+            this.protocol = protocol;
+            this.contextWindow = contextWindow;
             this.chat = chat;
             this.reply = reply;
             this.request = request;
@@ -124,7 +129,7 @@ final class ChatState {
         return chat == null ? draftChat : chat;
     }
 
-    boolean thinkingEnabled() { return thinkingEnabled(data.optBoolean("think")); }
+    boolean thinkingEnabled() { return thinkingEnabled(deepSeekFeatures() && data.optBoolean("think")); }
 
     boolean thinkingEnabled(boolean fallback) {
         return ModelOptions.local(optionsTarget()).optBoolean("think", fallback);
@@ -133,7 +138,7 @@ final class ChatState {
     void toggleThinking() {
         JSONObject chat = optionsTarget();
         boolean enabled = !thinkingEnabled();
-        if (ModelOptions.local(chat).isNull("think")) put(data, "think", enabled);
+        if (deepSeekFeatures() && ModelOptions.local(chat).isNull("think")) put(data, "think", enabled);
         else ModelOptions.setLocal(chat, "think", enabled);
     }
 
@@ -141,10 +146,22 @@ final class ChatState {
     String endpoint() { return custom() ? string(data, "customUrl") : ""; }
     ApiProvider apiProvider() {
         String preset = string(data, "apiPreset");
-        if (ApiProvider.DEEPSEEK.name().equals(preset)) return ApiProvider.DEEPSEEK;
-        if (ApiProvider.OPENAI.name().equals(preset)) return ApiProvider.OPENAI;
-        if (ApiProvider.CUSTOM.name().equals(preset)) return ApiProvider.CUSTOM;
-        return custom() ? ApiProvider.OPENAI : ApiProvider.DEEPSEEK;
+        try { return ApiProvider.valueOf(preset); }
+        catch (IllegalArgumentException ignored) { return custom() ? ApiProvider.OPENAI : ApiProvider.DEEPSEEK; }
+    }
+
+    ApiProtocol preferredProtocol(ApiProvider provider) { return ApiProtocol.saved(string(profile(provider), "protocol")); }
+    ApiProtocol apiProtocol() { return preferredProtocol(apiProvider()).resolve(apiProvider(), endpoint()); }
+    boolean deepSeekFeatures() { return apiProtocol().deepSeek(endpoint()); }
+
+    int preferredContextWindow(ApiProvider provider, String endpoint, ApiProtocol protocol, String model) {
+        JSONObject profile = profile(provider);
+        JSONObject windows = profile == null ? null : profile.optJSONObject("contextWindows");
+        return windows == null ? 0 : Math.max(0, windows.optInt(contextKey(endpoint, protocol, model)));
+    }
+
+    private static String contextKey(String endpoint, ApiProtocol protocol, String model) {
+        return endpoint + "\n" + protocol.name() + "\n" + model;
     }
 
     String preferredAddress(ApiProvider provider) {
@@ -175,18 +192,38 @@ final class ChatState {
     }
 
     void saveConnection(ApiProvider provider, String endpoint, String model, String name) {
+        ApiProtocol selected = preferredProtocol(provider);
+        saveConnection(provider, endpoint, model, name, selected,
+            preferredContextWindow(provider, endpoint, selected.resolve(provider, endpoint), model));
+    }
+
+    void saveConnection(ApiProvider provider, String endpoint, String model, String name, ApiProtocol selected, int contextWindow) {
         ApiProvider previous = apiProvider();
         String previousEndpoint = endpoint();
+        ApiProtocol previousProtocol = apiProtocol();
         JSONObject profiles = data.optJSONObject("apiProfiles");
         if (profiles == null) {
             profiles = new JSONObject();
             put(data, "apiProfiles", profiles);
         }
-        if (previous != provider) put(profiles, previous.name(),
+        if (previous != provider && profile(previous) == null) put(profiles, previous.name(),
             json("endpoint", previousEndpoint, "model", previousEndpoint.isEmpty() ? selectedModel() : string(data, "customModel"),
-                "name", string(profile(previous), "name")));
-        put(profiles, provider.name(), json("endpoint", endpoint, "model", model, "name", name));
-        if (!previousEndpoint.equals(endpoint)) attachments.clear();
+                "name", ""));
+        JSONObject stored = profile(provider);
+        if (stored == null) stored = new JSONObject();
+        put(stored, "endpoint", endpoint);
+        put(stored, "model", model);
+        put(stored, "name", name);
+        put(stored, "protocol", selected.name());
+        JSONObject windows = stored.optJSONObject("contextWindows");
+        if (windows == null) windows = new JSONObject();
+        ApiProtocol resolved = selected.resolve(provider, endpoint);
+        String contextKey = contextKey(endpoint, resolved, model);
+        if (contextWindow > 0) put(windows, contextKey, contextWindow);
+        else windows.remove(contextKey);
+        put(stored, "contextWindows", windows);
+        put(profiles, provider.name(), stored);
+        if (!previousEndpoint.equals(endpoint) || previousProtocol != resolved) attachments.clear();
         put(data, "apiPreset", provider.name());
         put(data, "provider", endpoint.isEmpty() ? "official" : "custom");
         if (endpoint.isEmpty()) put(data, "model", model);
@@ -208,6 +245,7 @@ final class ChatState {
     }
     private String modelFor(boolean searchEnabled, JSONArray messages) {
         if (custom()) return string(data, "customModel");
+        if (!deepSeekFeatures()) return selectedModel();
         if (searchEnabled) return FLASH;
         for (JSONObject message : objects(messages)) if (array(message, "files").length() > 0) return FLASH;
         return selectedModel();
@@ -215,7 +253,7 @@ final class ChatState {
 
     boolean sameProvider() {
         JSONObject chat = current();
-        return chat == null || endpoint().equals(string(chat, "apiEndpoint"));
+        return chat == null || (endpoint().equals(string(chat, "apiEndpoint")) && (deepSeekFeatures() || attachmentKey() == null));
     }
 
     String attachmentKey() {
@@ -298,6 +336,8 @@ final class ChatState {
     }
 
     Job start(JSONObject user, int replaceFrom) {
+        ApiProtocol api = apiProtocol();
+        boolean featured = api.deepSeek(endpoint());
         JSONObject chat = current();
         JSONArray existing = messages();
         if (chat == null) {
@@ -313,7 +353,7 @@ final class ChatState {
         }
         JSONArray next = new JSONArray();
         for (int i = 0; i < replaceFrom; i++) next.put(existing.opt(i));
-        if (!custom()) put(user, "reminder", currentReminder());
+        if (featured) put(user, "reminder", currentReminder());
         next.put(user);
         put(chat, "messages", next);
         put(chat, "updated", System.currentTimeMillis());
@@ -322,7 +362,7 @@ final class ChatState {
             String role = message.optString("role");
             String text = answer(message);
             if ("user".equals(role)) {
-                if (custom()) {
+                if (!featured) {
                     if (!text.isEmpty()) protocol.put(json("role", role, "content", text));
                 } else {
                     String reminder = string(message, "reminder");
@@ -336,7 +376,7 @@ final class ChatState {
                     if (content.length() > 0) protocol.put(json("role", role, "content", content));
                 }
             } else if (!text.isEmpty() && !message.optBoolean("excludeFromContext")) {
-                Object content = custom() ? text : message.optBoolean("complete") && !message.optBoolean("archived") ? array(message, "blocks")
+                Object content = !featured ? text : message.optBoolean("complete") && !message.optBoolean("archived") ? array(message, "blocks")
                     : new JSONArray().put(json("type", "text", "text", text));
                 protocol.put(json("role", "assistant", "content", content));
             }
@@ -344,10 +384,11 @@ final class ChatState {
         boolean thinkEnabled = user.optBoolean("think", thinkingEnabled());
         boolean searchEnabled = user.optBoolean("search", data.optBoolean("search"));
         String prompt = string(user, "text");
-        boolean requestedLookup = !custom() && searchEnabled && WebSources.explicitLookup(prompt);
+        boolean requestedLookup = featured && searchEnabled && WebSources.explicitLookup(prompt);
         String model = modelFor(searchEnabled, next);
+        int contextWindow = preferredContextWindow(apiProvider(), endpoint(), api, model);
         JSONObject request = json("model", model, "stream", true, "messages", protocol);
-        if (!custom()) {
+        if (featured) {
             put(request, "thinking", json("type", thinkEnabled ? "enabled" : "disabled"));
             put(request, "safety_check", json("level", "high"));
             if (replaceFrom == 0 && !chat.optBoolean("customTitle")) put(request, "title", json("enabled", true));
@@ -369,11 +410,15 @@ final class ChatState {
             }
         }
         ModelOptions.apply(this, chat, request, thinkEnabled);
+        if (api == ApiProtocol.OPENAI && contextWindow > 0 && !request.has("max_tokens") && !request.has("max_completion_tokens")
+            && "legacy".equals(string(ModelOptions.local(chat), "tokenField"))) {
+            put(request, "max_tokens", api.outputLimit(request, contextWindow));
+        }
         JSONObject reply = json("role", "assistant", "blocks", new JSONArray(), "status", "回复已中断，可以重新生成。");
         if (requestedLookup) put(reply, "lookupRequested", true);
         next.put(reply);
-        job = new Job(++sequence, endpoint(), chat, reply, request,
-            custom() ? null : attachmentKey(next, Collections.emptyList()));
+        job = new Job(++sequence, endpoint(), api, contextWindow, chat, reply, request,
+            featured ? attachmentKey(next, Collections.emptyList()) : null);
         return job;
     }
 
@@ -424,7 +469,7 @@ final class ChatState {
         JSONObject reply = active.reply;
         JSONArray blocks = array(reply, "blocks");
         String type = event.optString("type");
-        String responseId = active.endpoint.isEmpty()
+        String responseId = active.protocol == ApiProtocol.ANTHROPIC
             ? "message_start".equals(type) ? string(event.optJSONObject("message"), "id") : ""
             : string(event, "id");
         if (!responseId.isEmpty()) {
@@ -434,7 +479,7 @@ final class ChatState {
             }
             active.responseId = responseId;
         }
-        if (!active.endpoint.isEmpty()) {
+        if (active.protocol != ApiProtocol.ANTHROPIC) {
             if ("openai_done".equals(type)) { finish(""); return; }
             JSONObject error = event.optJSONObject("error");
             if (error != null || "error".equals(type)) {

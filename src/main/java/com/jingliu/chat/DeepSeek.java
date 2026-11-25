@@ -112,11 +112,12 @@ final class DeepSeek {
             case 429: message = "请求过于频繁，请稍后重试。"; break;
             default:
                 message = status >= 500 ? "接口服务暂不可用。" : "接口请求失败（HTTP " + status + "）。";
-                if (status == 400 || status == 422) {
+                if (status == 400 || status == 404 || status == 422) {
                     try (InputStream error = connection.getErrorStream()) {
                         if (error != null) {
                             JSONObject payload = new JSONObject(new String(read(error, 8192), StandardCharsets.UTF_8));
-                            JSONObject failure = payload.getJSONObject("error");
+                            JSONObject failure = errorDetails(payload);
+                            if (failure == null) failure = payload;
                             String detail = failure.optString("message");
                             contextLimit = contextLimit(failure);
                             if (!detail.isEmpty()) message += " " + detail.substring(0, Math.min(250, detail.length()));
@@ -152,16 +153,18 @@ final class DeepSeek {
         }
     }
 
-    static void stream(Request request, String endpoint, String key, String body, boolean compactContext,
-            Consumer<JSONObject> listener) throws Exception {
-        boolean official = endpoint.isEmpty();
-        String payload = compactContext ? ContextCompression.prepare(body, official, ContextCompression.NORMAL, false) : body;
-        int[] retryBudgets = {ContextCompression.RETRY, 0};
+    static void stream(Request request, String endpoint, ApiProtocol protocol, String key, String body, boolean compactContext,
+            int contextWindow, boolean thinking, Consumer<JSONObject> listener) throws Exception {
+        boolean official = protocol.deepSeek(endpoint);
+        int budget = contextWindow > 0 ? contextWindow - protocol.outputLimit(new JSONObject(body), contextWindow) : ContextCompression.NORMAL;
+        if (budget <= 0) throw new ApiError("最大输出 Token 必须小于模型上下文窗口。");
+        String payload = compactContext ? ContextCompression.prepare(body, official, budget, false) : body;
+        int[] retryBudgets = {Math.min(ContextCompression.RETRY, budget / 2), 0};
         int nextRetry = 0;
         while (true) {
             boolean[] forwarded = {false};
             try {
-                streamWithTools(request, endpoint, key, payload, event -> {
+                streamWithTools(request, endpoint, protocol, key, payload, contextWindow, thinking, event -> {
                     forwarded[0] = true;
                     listener.accept(event);
                 });
@@ -179,41 +182,66 @@ final class DeepSeek {
         }
     }
 
-    private static void streamWithTools(Request request, String endpoint, String key, String body,
+    private static void streamWithTools(Request request, String endpoint, ApiProtocol protocol, String key, String body,
+            int contextWindow, boolean thinking,
             Consumer<JSONObject> listener) throws Exception {
         try {
-            streamOnce(request, endpoint, key, body, listener);
+            streamOnce(request, endpoint, protocol, key, body, contextWindow, thinking, listener);
         } catch (ApiError error) {
-            if (!endpoint.isEmpty() || error.contextLimit || error.status != 400 || !error.getMessage().contains("tool_choice")) throw error;
+            if (!protocol.deepSeek(endpoint) || error.contextLimit || error.status != 400 || !error.getMessage().contains("tool_choice")) throw error;
             JSONObject payload = new JSONObject(body);
             if (payload.remove("tool_choice") == null) throw error;
             request.close();
-            streamOnce(request, endpoint, key, payload.toString(), listener);
+            streamOnce(request, endpoint, protocol, key, payload.toString(), contextWindow, thinking, listener);
         }
     }
 
-    private static void streamOnce(Request request, String endpoint, String key, String body, Consumer<JSONObject> listener) throws Exception {
-        boolean official = endpoint.isEmpty();
-        HttpURLConnection connection = official ? request.open("/anthropic/v1/messages", "POST", key)
-            : request.custom(endpoint, "/chat/completions", "POST", key);
-        if (official) {
-            connection.setRequestProperty("anthropic-version", "2023-06-01");
-            connection.setRequestProperty("anthropic-beta", "files-api-2025-04-14");
-        }
-        connection.setRequestProperty("Accept", "text/event-stream");
+    private static void streamOnce(Request request, String endpoint, ApiProtocol protocol, String key, String body,
+            int contextWindow, boolean thinking, Consumer<JSONObject> listener) throws Exception {
+        JSONObject payload = new JSONObject(body);
+        HttpURLConnection connection = protocol.chat(request, endpoint, key, payload.optString("model"), true);
+        connection.setRequestProperty("Accept", protocol == ApiProtocol.OLLAMA ? "application/x-ndjson" : "text/event-stream");
+        body = protocol.encode(payload, endpoint, contextWindow, thinking).toString();
         RequestLog.Entry trace = request.trace;
         if (trace != null) trace.request(connection.getURL().toExternalForm(), body, key);
         jsonBody(connection, body);
         try (InputStream input = checkedBody(connection, trace)) {
             String type = connection.getContentType();
-            if (!official && type != null && type.toLowerCase(Locale.ROOT).contains("application/json")) {
+            Consumer<JSONObject> events = event -> protocol.response(event, listener);
+            if (!protocol.deepSeek(endpoint) && type != null && type.toLowerCase(Locale.ROOT).contains("application/json")) {
                 String data = new String(read(input, 16 * 1024 * 1024), StandardCharsets.UTF_8);
                 if (trace != null) trace.response(data, key);
-                deliver(new JSONObject(data), listener);
-                listener.accept(new JSONObject().put("type", "openai_done"));
-                return;
+                JSONObject response = new JSONObject(data);
+                if (protocol == ApiProtocol.ANTHROPIC && response.has("content")) anthropicMessage(response, listener);
+                else {
+                    deliver(response, events);
+                    if (protocol == ApiProtocol.OPENAI) listener.accept(new JSONObject().put("type", "openai_done"));
+                }
+            } else if (protocol == ApiProtocol.OLLAMA) ndjson(input, events, trace, key);
+            else events(input, events, trace, key);
+        }
+    }
+
+    private static void anthropicMessage(JSONObject response, Consumer<JSONObject> listener) throws Exception {
+        listener.accept(new JSONObject().put("type", "message_start").put("message", response));
+        org.json.JSONArray content = response.getJSONArray("content");
+        for (int i = 0; i < content.length(); i++) {
+            listener.accept(new JSONObject().put("type", "content_block_start").put("index", i).put("content_block", content.get(i)));
+        }
+        listener.accept(new JSONObject().put("type", "message_delta").put("delta", response));
+        listener.accept(new JSONObject().put("type", "message_stop"));
+    }
+
+    private static void ndjson(InputStream input, Consumer<JSONObject> listener, RequestLog.Entry trace, String key) throws Exception {
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(input, StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                if (line.trim().isEmpty()) continue;
+                if (trace != null) trace.response(line, key);
+                JSONObject event = new JSONObject(line);
+                deliver(event, listener);
+                if (event.optBoolean("done") || event.has("error")) return;
             }
-            events(input, listener, trace, key);
         }
     }
 
@@ -244,11 +272,17 @@ final class DeepSeek {
     }
 
     private static void deliver(JSONObject event, Consumer<JSONObject> listener) throws ApiError {
-        JSONObject error = event.optJSONObject("error");
+        JSONObject error = errorDetails(event);
         if (error != null && contextLimit(error)) {
             throw new ApiError(error.optString("message", "请求超过模型的上下文上限。"), 0, true);
         }
         listener.accept(event);
+    }
+
+    private static JSONObject errorDetails(JSONObject payload) {
+        Object error = payload.opt("error");
+        if (error instanceof JSONObject) return (JSONObject) error;
+        return error instanceof String ? MainActivity.json("message", error) : null;
     }
 
     private static boolean contextLimit(JSONObject error) {
@@ -259,7 +293,8 @@ final class DeepSeek {
         return detail.contains("maximum context length") || detail.contains("max context length")
             || detail.contains("context length exceeded") || detail.contains("context window exceeded")
             || detail.contains("prompt is too long") || detail.contains("prompt is too large")
-            || detail.contains("input is too long") || detail.contains("超出上下文") || detail.contains("超过上下文");
+            || detail.contains("input is too long") || detail.contains("input token count") && detail.contains("exceeds")
+            || detail.contains("超出上下文") || detail.contains("超过上下文");
     }
 
     static JSONObject json(HttpURLConnection connection) throws Exception {

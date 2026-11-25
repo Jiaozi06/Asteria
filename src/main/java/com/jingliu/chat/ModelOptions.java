@@ -67,7 +67,7 @@ final class ModelOptions {
 
     static void apply(ChatState state, JSONObject chat, JSONObject request, boolean thinking) {
         JSONObject options = local(chat);
-        boolean compatible = state.custom();
+        boolean compatible = !state.deepSeekFeatures();
         String model = string(request, "model").toLowerCase(Locale.ROOT);
         model = model.substring(model.lastIndexOf('/') + 1);
         boolean r1 = model.matches("deepseek-r1(?:[-.:].*)?");
@@ -100,7 +100,7 @@ final class ModelOptions {
                 instructions.add("Return only a valid JSON object.");
             }
             JSONObject extras = options.optJSONObject("extras");
-            if (extras != null && unsupportedKey(extras) == null) {
+            if (state.apiProtocol() == ApiProtocol.OPENAI && extras != null && unsupportedKey(extras) == null) {
                 Iterator<String> keys = extras.keys();
                 while (keys.hasNext()) {
                     String name = keys.next();

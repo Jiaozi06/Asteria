@@ -74,6 +74,9 @@ final class NativeChat {
     private String heldVoiceText = "";
     private String keyStatus = "", pendingUrl, pendingModel;
     private ApiProvider pendingProvider, providerDraft;
+    private ApiProtocol pendingProtocol, protocolDraft;
+    private int pendingContextWindow;
+    private String contextWindowDraft = "";
     private String providerNameDraft, pendingProviderName, keyManagementEndpoint;
     private int screen;
     private JSONObject editedOptionsChat;
@@ -124,10 +127,10 @@ final class NativeChat {
     private VoiceHalo voiceHalo;
     private TextView voiceHint;
     private ImageButton send, mic, add, returnBottom;
-    private EditText input, apiKey, apiUrl, apiModel, providerName;
+    private EditText input, apiKey, apiUrl, apiModel, apiWindow, providerName;
     private LinearLayout modelRow;
     private ImageButton modelArrow;
-    private TextView modelsFeedback, refreshModels, providerRow, resetAddress;
+    private TextView modelsFeedback, refreshModels, providerRow, protocolRow, resetAddress;
     private String[] upstreamModels = {};
     private String modelsStatus = "";
     private Runnable modelLookup;
@@ -691,14 +694,39 @@ final class NativeChat {
         footer.addView(attachmentPanel, MATCH_PARENT, WRAP_CONTENT);
         setAttachmentPanel(attachmentPanelOpen, false);
         int footerColor = dark ? 0xff9299a3 : 0xff697486;
-        LinearLayout footnote = horizontal();
-        footnote.setGravity(Gravity.CENTER);
-        footnote.setMinimumHeight(dp(24));
-        footnote.addView(text("回答由 AI 生成，仅供参考", 11, footerColor), WRAP_CONTENT, WRAP_CONTENT);
-        balanceFooter = text("", 11, footerColor);
-        LinearLayout.LayoutParams balanceArea = new LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT);
-        balanceArea.setMarginStart(dp(10));
-        footnote.addView(balanceFooter, balanceArea);
+        TextView note = text("回答由 AI 生成，仅供参考", 11, footerColor);
+        note.setGravity(Gravity.CENTER);
+        TextView balance = balanceFooter = text("", 11, footerColor);
+        balance.setGravity(Gravity.RIGHT | Gravity.CENTER_VERTICAL);
+        FrameLayout footnote = new FrameLayout(context) {
+            private boolean separateLine;
+            private int firstLineHeight;
+
+            @Override protected void onMeasure(int widthSpec, int heightSpec) {
+                int width = MeasureSpec.getSize(widthSpec);
+                int available = MeasureSpec.makeMeasureSpec(width, MeasureSpec.AT_MOST);
+                int naturalHeight = MeasureSpec.makeMeasureSpec(0, MeasureSpec.UNSPECIFIED);
+                note.measure(available, naturalHeight);
+                boolean showBalance = balance.getVisibility() != GONE;
+                if (showBalance) balance.measure(available, naturalHeight);
+                separateLine = showBalance && balance.getMeasuredWidth() + dp(8) > (width - note.getMeasuredWidth()) / 2;
+                int sameLineBalanceHeight = showBalance && !separateLine ? balance.getMeasuredHeight() : 0;
+                firstLineHeight = Math.max(dp(24), Math.max(note.getMeasuredHeight(), sameLineBalanceHeight));
+                setMeasuredDimension(width, firstLineHeight + (separateLine ? balance.getMeasuredHeight() : 0));
+            }
+
+            @Override protected void onLayout(boolean changed, int left, int top, int right, int bottom) {
+                int width = right - left;
+                int noteLeft = (width - note.getMeasuredWidth()) / 2;
+                int noteTop = (firstLineHeight - note.getMeasuredHeight()) / 2;
+                note.layout(noteLeft, noteTop, noteLeft + note.getMeasuredWidth(), noteTop + note.getMeasuredHeight());
+                if (balance.getVisibility() == GONE) return;
+                int balanceTop = separateLine ? firstLineHeight : (firstLineHeight - balance.getMeasuredHeight()) / 2;
+                balance.layout(width - balance.getMeasuredWidth(), balanceTop, width, balanceTop + balance.getMeasuredHeight());
+            }
+        };
+        footnote.addView(note, WRAP_CONTENT, WRAP_CONTENT);
+        footnote.addView(balance, WRAP_CONTENT, WRAP_CONTENT);
         footer.addView(footnote, MATCH_PARENT, WRAP_CONTENT);
         updateBalanceFooter();
 
@@ -729,7 +757,7 @@ final class NativeChat {
         chip.setCompoundDrawablePadding(dp(4));
     }
     private void toggle(String option) {
-        if (state.custom()) {
+        if (!state.deepSeekFeatures() && (!"think".equals(option) || !hasThinkingToggle())) {
             if ("think".equals(option)) {
                 openChatOptions();
             } else {
@@ -748,10 +776,14 @@ final class NativeChat {
         controls();
     }
 
+    private boolean hasThinkingToggle() {
+        return state.deepSeekFeatures() || state.apiProtocol() == ApiProtocol.GEMINI || state.apiProtocol() == ApiProtocol.OLLAMA;
+    }
+
     private boolean startVoice(boolean hold) {
-        if (busy() || (!state.custom() && !requireKey())) return false;
+        if (busy() || (state.deepSeekFeatures() && !requireKey())) return false;
         setAttachmentPanel(false, true);
-        return services.beginVoice(state.custom(), hold);
+        return services.beginVoice(!state.deepSeekFeatures(), hold);
     }
 
     void updateInputHint() {
@@ -864,10 +896,10 @@ final class NativeChat {
         boolean generating = state.job != null;
         boolean modifying = editing != null;
         boolean composing = !draft.trim().isEmpty() || !state.attachments.isEmpty();
-        boolean official = !state.custom();
+        boolean official = state.deepSeekFeatures();
         boolean voice = voiceMode && !modifying && !generating;
         updateChatHeader();
-        setChip(think, official && (modifying ? editing.think : state.thinkingEnabled()));
+        setChip(think, hasThinkingToggle() && (modifying ? editing.think : state.thinkingEnabled()));
         setChip(search, official && (modifying ? editing.search : state.data.optBoolean("search")));
         think.setEnabled(!generating);
         search.setEnabled(!generating);
@@ -1027,7 +1059,7 @@ final class NativeChat {
 
     private void selectAttachment(java.util.function.Consumer<String> launch) {
         setAttachmentPanel(false, true);
-        if (state.custom()) {
+        if (!state.deepSeekFeatures()) {
             composerNotice("添加附件", "当前的图片和文档上传使用 DeepSeek 官方接口。", "API 设置", this::openApiSettings);
             return;
         }
@@ -1205,8 +1237,8 @@ final class NativeChat {
     }
     private boolean allowProvider() {
         if (state.sameProvider()) return true;
-        new AlertDialog.Builder(context).setTitle("此会话使用另一接口")
-            .setMessage("可切换回原接口继续会话，或使用当前接口新建对话。")
+        new AlertDialog.Builder(context).setTitle("当前接口无法继续此会话")
+            .setMessage("可切换回原接口和协议继续会话，或用当前设置新建对话。")
             .setPositiveButton("新对话", (d, w) -> {
                 if (!mayChange() || !prepareConversationSwitch(null)) return;
                 String pending = draft;
@@ -1227,8 +1259,8 @@ final class NativeChat {
         renderMessages(true);
         controls();
         if (drawer.isRevealed()) refreshHistory();
-        services.stream(job.id, string(job.chat, "id"), state.apiProvider(), job.endpoint, job.request.toString(), state.data.optBoolean("compactContext", true),
-            job.attachmentKey);
+        services.stream(job.id, string(job.chat, "id"), state.apiProvider(), job.endpoint, job.protocol, job.request.toString(),
+            state.data.optBoolean("compactContext", true), job.contextWindow, user.optBoolean("think"), job.attachmentKey);
     }
     private void finish(ChatState.Job completed, String error) {
         state.finish(error);
@@ -1666,7 +1698,7 @@ final class NativeChat {
         if (!mayChange() || !requireKey() || !allowProvider()) return;
         JSONObject prior = state.messages().optJSONObject(index - 1);
         if (prior == null || !"user".equals(prior.optString("role"))) return;
-        if (!state.custom()) put(prior, "think", state.thinkingEnabled(prior.optBoolean("think", state.data.optBoolean("think"))));
+        if (hasThinkingToggle()) put(prior, "think", state.thinkingEnabled(prior.optBoolean("think", state.thinkingEnabled())));
         generate(prior, index - 1);
     }
     private void copy(String value) { services.copy(value); toast("已复制"); }
@@ -2448,9 +2480,11 @@ final class NativeChat {
         if (!apiFromSettings && !prepareSettingsFromChat()) return;
         screen = API_SETTINGS;
         providerDraft = state.apiProvider();
+        protocolDraft = state.preferredProtocol(providerDraft);
         providerNameDraft = state.providerName(providerDraft);
         urlDraft = state.preferredAddress(providerDraft);
         modelDraft = state.preferredModel(providerDraft, state.endpoint());
+        contextWindowDraft = savedContextWindow(modelDraft);
         keyDraft = "";
         stopModelLookup();
         if (!checking) keyStatus = "";
@@ -2809,7 +2843,9 @@ final class NativeChat {
         pad(body, 16, 10);
         scroll.addView(body, MATCH_PARENT, WRAP_CONTENT);
 
-        boolean custom = state.custom();
+        boolean custom = !state.deepSeekFeatures();
+        ApiProtocol protocol = state.apiProtocol();
+        boolean openAi = protocol == ApiProtocol.OPENAI;
         String model = state.effectiveModel();
         String provider = custom ? state.providerName(state.apiProvider()) + " · " + (model.isEmpty() ? "尚未选择模型" : model)
             : "DeepSeek 官方 · Flash / V4 Pro";
@@ -2832,7 +2868,7 @@ final class NativeChat {
         LinearLayout output = settingsGroup(body, "输出与推理");
         modelNumber(output, "最大输出 Token", "outputLimit", "限制单次生成的 Token 数。上游模型可能有更低的限制。",
             1, custom ? Integer.MAX_VALUE : 393216, true);
-        if (custom) {
+        if (openAi) {
             modelChoice(output, "长度字段", "tokenField",
                 new String[]{"max_completion_tokens", "max_tokens（兼容旧接口）"}, new String[]{"", "legacy"});
             modelChoice(output, "推理强度", "reasoning_effort",
@@ -2840,7 +2876,14 @@ final class NativeChat {
                 new String[]{"", "none", "minimal", "low", "medium", "high", "xhigh", "max"});
             modelChoice(output, "回复详略", "verbosity", new String[]{"默认", "简短", "适中", "详细"},
                 new String[]{"", "low", "medium", "high"});
-            modelChoice(output, "输出格式", "format", new String[]{"默认", "JSON 对象"}, new String[]{"", "json"});
+        } else if (!custom) {
+            modelChoice(output, "推理强度", "reasoning_effort",
+                new String[]{"默认", "Low", "High", "Max"}, new String[]{"", "low", "high", "max"});
+            settingsNote(body, "选择 Low、High 或 Max 会为当前对话打开深度思考。关闭深度思考后，推理强度不生效。");
+        }
+        if (custom) {
+            if (protocol != ApiProtocol.ANTHROPIC) modelChoice(output, "输出格式", "format",
+                new String[]{"默认", "JSON 对象"}, new String[]{"", "json"});
             modelInput(output, "停止序列", "stop", "每行一条，最多 4 条。命中后模型停止生成，部分模型不支持。",
                 "每行输入一条停止序列", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE, raw -> {
                     JSONArray stops = new JSONArray();
@@ -2848,26 +2891,27 @@ final class NativeChat {
                     if (stops.length() > 4) throw new IllegalArgumentException("最多 4 条停止序列");
                     return stops.length() == 0 ? null : stops;
                 });
-        } else {
-            modelChoice(output, "推理强度", "reasoning_effort",
-                new String[]{"默认", "Low", "High", "Max"}, new String[]{"", "low", "high", "max"});
-            settingsNote(body, "选择 Low、High 或 Max 会为当前对话打开深度思考。关闭深度思考后，推理强度不生效。");
         }
 
         LinearLayout sampling = settingsGroup(body, "采样");
         modelNumber(sampling, "温度", "temperature", custom
             ? "温度与 Top-P 通常只需调整其中一项。DeepSeek Chat 默认 1.0，DeepSeek-R1 默认 0.6。"
-            : "默认 1.0。温度设置在关闭「深度思考」时生效。", 0, 2, false);
+            : "默认 1.0。温度设置在关闭「深度思考」时生效。", 0, protocol == ApiProtocol.ANTHROPIC && custom ? 1 : 2, false);
         if (custom) {
             modelNumber(sampling, "Top-P", "top_p", "控制采样时考虑的候选词范围。",
                 0, 1, false);
+        }
+        if (openAi) {
             modelNumber(sampling, "频率惩罚", "frequency_penalty", "正值减少重复用词，负值更容许重复。",
                 -2, 2, false);
             modelNumber(sampling, "存在惩罚", "presence_penalty", "正值鼓励模型探索尚未提及的话题。",
                 -2, 2, false);
+        }
+        if (custom && protocol != ApiProtocol.ANTHROPIC) {
             modelInput(sampling, "随机种子", "seed", "部分接口用固定种子提高复现性。相同种子也可能生成不同结果。",
                 "上游默认", InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_SIGNED, Long::valueOf);
-
+        }
+        if (openAi) {
             LinearLayout extension = settingsGroup(body, "接口扩展");
             modelInput(extension, "额外请求参数", "extras", "填写上游文档支持的 JSON 对象。已在本页提供或由客户端管理的字段请使用对应设置。",
                 "{\"top_k\": 40}", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE, raw -> {
@@ -2919,7 +2963,7 @@ final class NativeChat {
 
     private void storeModelOption(String key, Object value) {
         ModelOptions.setLocal(editedOptionsChat, key, value);
-        if (!state.custom() && "reasoning_effort".equals(key) && value != null) {
+        if (state.deepSeekFeatures() && "reasoning_effort".equals(key) && value != null) {
             ModelOptions.setLocal(editedOptionsChat, "think", true);
         }
         if (state.current() != null) save();
@@ -3337,16 +3381,13 @@ final class NativeChat {
         pad(form, 18, 9);
         scroll.addView(form, MATCH_PARENT, WRAP_CONTENT);
         label(form, "模型提供商");
-        providerRow = action("", () -> choiceSheet("模型提供商", new String[]{"DeepSeek", "OpenAI", "自定义提供商"},
+        String[] providers = java.util.Arrays.stream(ApiProvider.values()).map(item -> item.label).toArray(String[]::new);
+        providerRow = apiPicker(() -> choiceSheet("模型提供商", providers,
             providerDraft.ordinal(), selected -> selectApiProvider(ApiProvider.values()[selected])));
-        providerRow.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
-        providerRow.setTextSize(15);
-        providerRow.setTextColor(ink);
-        providerRow.setCompoundDrawablesRelativeWithIntrinsicBounds(null, null, context.getDrawable(R.drawable.ic_chevron), null);
-        providerRow.setCompoundDrawableTintList(ColorStateList.valueOf(muted));
-        pad(providerRow, 14, 0);
-        buttonBackground(providerRow, surface, edge, 14);
         form.addView(providerRow, MATCH_PARENT, dp(52));
+        label(form, "API 调用协议");
+        protocolRow = apiPicker(this::chooseApiProtocol);
+        form.addView(protocolRow, MATCH_PARENT, dp(52));
         providerName = null;
         if (providerDraft == ApiProvider.CUSTOM) {
             label(form, "提供商名称");
@@ -3364,10 +3405,11 @@ final class NativeChat {
         form.addView(apiUrl, MATCH_PARENT, WRAP_CONTENT);
         resetAddress = null;
         if (!providerDraft.address.isEmpty()) {
-            resetAddress = action("恢复官方地址", () -> apiUrl.setText(providerDraft.address));
+            resetAddress = action("恢复默认地址", () -> apiUrl.setText(providerDraft.address));
             resetAddress.setTextSize(12);
             form.addView(resetAddress, WRAP_CONTENT, WRAP_CONTENT);
         }
+        if (providerDraft == ApiProvider.OLLAMA) settingsNote(form, "Ollama 运行在电脑上时，请填写电脑的局域网地址和端口。");
 
         label(form, "密钥");
         apiKey = field("输入 API Key", true);
@@ -3404,6 +3446,14 @@ final class NativeChat {
         modelInfo.addView(refreshModels);
         form.addView(modelInfo, MATCH_PARENT, WRAP_CONTENT);
 
+        label(form, "模型上下文窗口（Token）");
+        apiWindow = field("留空使用默认预算", false);
+        apiWindow.setContentDescription("模型上下文窗口");
+        apiWindow.setInputType(InputType.TYPE_CLASS_NUMBER);
+        apiWindow.setText(contextWindowDraft);
+        form.addView(apiWindow, MATCH_PARENT, WRAP_CONTENT);
+        settingsNote(form, "按模型保存。用于自动压缩，Ollama 也会收到该设置。");
+
         gap(form, 10);
         LinearLayout actions = horizontal();
         form.addView(actions, MATCH_PARENT, WRAP_CONTENT);
@@ -3430,12 +3480,40 @@ final class NativeChat {
             if (!java.util.Objects.equals(previous, next)) {
                 apiKey.setText("");
                 apiModel.setText(state.preferredModel(providerDraft, next));
+                apiWindow.setText(savedContextWindow(apiModel.getText().toString()));
             }
             keyStatus = "";
             updateKeyFeedback();
             queueModelLookup();
         });
         watch(apiKey, value -> queueModelLookup());
+        watch(apiModel, value -> apiWindow.setText(savedContextWindow(value)));
+    }
+
+    private TextView apiPicker(Runnable open) {
+        TextView row = action("", open);
+        row.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
+        row.setTextSize(15);
+        row.setTextColor(ink);
+        row.setCompoundDrawablesRelativeWithIntrinsicBounds(null, null, context.getDrawable(R.drawable.ic_chevron), null);
+        row.setCompoundDrawableTintList(ColorStateList.valueOf(muted));
+        pad(row, 14, 0);
+        buttonBackground(row, surface, edge, 14);
+        return row;
+    }
+
+    private void chooseApiProtocol() {
+        if (checking) return;
+        String[] labels = java.util.Arrays.stream(ApiProtocol.values()).map(item -> item.label).toArray(String[]::new);
+        choiceSheet("API 调用协议", labels, protocolDraft.ordinal(), index -> {
+            ApiProtocol next = ApiProtocol.values()[index];
+            if (protocolDraft == next) return;
+            protocolDraft = next;
+            apiWindow.setText(savedContextWindow(apiModel.getText().toString()));
+            keyStatus = "";
+            updateKeyFeedback();
+            queueModelLookup();
+        });
     }
 
     private void openKeySettings() {
@@ -3554,9 +3632,11 @@ final class NativeChat {
         if (checking || next == providerDraft) return;
         services.hideKeyboard();
         providerDraft = next;
+        protocolDraft = state.preferredProtocol(next);
         providerNameDraft = state.providerName(next);
         urlDraft = state.preferredAddress(next);
         modelDraft = state.preferredModel(next, editingEndpoint());
+        contextWindowDraft = savedContextWindow(modelDraft);
         keyDraft = "";
         keyStatus = "";
         stopModelLookup();
@@ -3567,11 +3647,27 @@ final class NativeChat {
     private void captureEndpointFields() {
         if (apiUrl != null) urlDraft = apiUrl.getText().toString();
         if (apiModel != null) modelDraft = apiModel.getText().toString();
+        if (apiWindow != null) contextWindowDraft = apiWindow.getText().toString();
         if (providerName != null) providerNameDraft = providerName.getText().toString().trim();
     }
 
     private String editingEndpoint() {
-        return urlDraft == null ? null : providerDraft.endpoint(urlDraft);
+        if (urlDraft == null) return null;
+        ApiProtocol selection = protocolDraft == ApiProtocol.AUTO ? providerDraft.protocol : protocolDraft;
+        return providerDraft.endpoint(urlDraft, selection);
+    }
+
+    private ApiProtocol editingProtocol() { return protocolDraft.resolve(providerDraft, editingEndpoint()); }
+
+    private String savedContextWindow(String model) {
+        String id = model.trim();
+        ApiProtocol protocol = editingProtocol();
+        if (protocol == ApiProtocol.GEMINI) {
+            String normalized = ApiProtocol.geminiModel(id);
+            if (normalized != null) id = normalized;
+        }
+        int limit = state.preferredContextWindow(providerDraft, editingEndpoint(), protocol, id);
+        return limit > 0 ? Integer.toString(limit) : "";
     }
 
     private void stopModelLookup() {
@@ -3610,7 +3706,7 @@ final class NativeChat {
             }
             else {
                 modelsStatus = "正在读取上游模型…";
-                services.discoverModels(modelLookupId, providerDraft, endpoint, candidate);
+                services.discoverModels(modelLookupId, providerDraft, endpoint, editingProtocol(), candidate);
             }
         }
         showModelLookupState();
@@ -3649,9 +3745,14 @@ final class NativeChat {
         providerRow.setText(providerDraft.label);
         providerRow.setContentDescription("模型提供商，当前：" + providerDraft.label);
         providerRow.setEnabled(!checking);
+        String protocolLabel = protocolDraft == ApiProtocol.AUTO ? "自动 · " + editingProtocol().label : protocolDraft.label;
+        protocolRow.setText(protocolLabel);
+        protocolRow.setContentDescription("API 调用协议，当前：" + protocolLabel);
+        protocolRow.setEnabled(!checking);
         apiUrl.setEnabled(!checking);
         apiKey.setEnabled(!checking);
         apiModel.setEnabled(!checking);
+        apiWindow.setEnabled(!checking);
         refreshModels.setEnabled(!checking);
         if (providerName != null) providerName.setEnabled(!checking);
         if (resetAddress != null) {
@@ -3670,10 +3771,25 @@ final class NativeChat {
         if (checking) return;
         captureEndpointFields();
         String endpoint = editingEndpoint();
+        ApiProtocol protocol = editingProtocol();
         String model = modelDraft.trim();
         String candidate = apiKey.getText().toString().trim();
         if (endpoint == null) { keyStatus = "请输入有效的 HTTP 或 HTTPS 接口地址。"; updateKeyFeedback(); return; }
         if (model.isEmpty() || model.matches(".*\\s.*")) { keyStatus = "请填写有效的模型 ID。"; updateKeyFeedback(); return; }
+        if (protocol == ApiProtocol.GEMINI) {
+            model = ApiProtocol.geminiModel(model);
+            if (model == null) { keyStatus = "请填写有效的 Gemini 模型 ID。"; updateKeyFeedback(); return; }
+        }
+        int context = 0;
+        if (!contextWindowDraft.trim().isEmpty()) {
+            try {
+                context = Integer.parseInt(contextWindowDraft.trim());
+                if (context < 2) throw new NumberFormatException();
+            } catch (NumberFormatException error) {
+                apiWindow.setError("请输入大于 1 的整数，或留空使用默认预算");
+                return;
+            }
+        }
         if (providerDraft == ApiProvider.CUSTOM && providerNameDraft.length() > 40) {
             keyStatus = "提供商名称最多 40 个字符";
             updateKeyFeedback();
@@ -3682,16 +3798,21 @@ final class NativeChat {
         if ((ApiProvider.requiresKey(endpoint) && candidate.isEmpty() && !services.hasKey(endpoint)) || candidate.matches(".*\\s.*")) {
             keyStatus = "请填写有效的 API Key。"; updateKeyFeedback(); return;
         }
-        if (busy() && !endpoint.equals(state.endpoint())) { toast("当前操作完成后即可切换接口。"); return; }
+        if (busy() && (providerDraft != state.apiProvider() || !endpoint.equals(state.endpoint()) || protocol != state.apiProtocol())) {
+            toast("当前操作完成后即可切换接口和协议。");
+            return;
+        }
         services.hideKeyboard();
         checking = true;
         pendingUrl = endpoint;
         pendingModel = model;
         pendingProvider = providerDraft;
+        pendingProtocol = protocolDraft;
+        pendingContextWindow = context;
         pendingProviderName = providerDraft == ApiProvider.CUSTOM ? providerNameDraft : "";
         keyStatus = test ? "正在测试连接…" : "正在保存…";
         updateKeyFeedback();
-        services.verify(providerDraft, endpoint, model, candidate, test);
+        services.verify(providerDraft, endpoint, protocol, model, candidate, test);
     }
 
     private void choicePopup(View anchor, ImageView arrow, String[] choices, int current, java.util.function.IntConsumer selected) {
@@ -3808,13 +3929,15 @@ final class NativeChat {
                     boolean saved = error.isEmpty() && event.optBoolean("saved");
                     keyStatus = error.isEmpty() ? event.optString("message", "API Key 已保存") : error;
                     if (saved) {
-                        state.saveConnection(pendingProvider, pendingUrl, pendingModel, pendingProviderName);
+                        state.saveConnection(pendingProvider, pendingUrl, pendingModel, pendingProviderName, pendingProtocol, pendingContextWindow);
                         save();
                         if (screen == API_SETTINGS) {
                             providerDraft = pendingProvider;
+                            protocolDraft = pendingProtocol;
                             providerNameDraft = state.providerName(providerDraft);
                             urlDraft = state.preferredAddress(providerDraft);
                             modelDraft = pendingModel;
+                            contextWindowDraft = savedContextWindow(modelDraft);
                             keyDraft = "";
                             show(Motion.NONE, false);
                             queueModelLookup();
@@ -3822,6 +3945,7 @@ final class NativeChat {
                     }
                     pendingUrl = pendingModel = null;
                     pendingProvider = null;
+                    pendingProtocol = null;
                     pendingProviderName = null;
                 }
                 updateKey();
