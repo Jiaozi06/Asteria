@@ -41,7 +41,6 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
-import java.util.function.IntConsumer;
 import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
@@ -183,7 +182,7 @@ public final class MainActivity extends Activity {
         if (Build.VERSION.SDK_INT < 33 || screen == null) return;
         if (screen.handlesBack()) {
             if (unregisterBack == null) unregisterBack = AndroidWindowEffects.registerBack(getWindow(),
-                () -> screen.back(), screen::previewBack, screen::cancelBackPreview);
+                screen::commitSystemBack, screen::previewBack, screen::cancelBackPreview);
         } else releaseSystemBack();
     }
 
@@ -330,23 +329,56 @@ public final class MainActivity extends Activity {
         void readNebula(Consumer<MemoryNebula.Snapshot> done) { readNebulaAfter(nebula::snapshot, done); }
 
         void collectNebula(NebulaSummaries.Target target, List<String> chatIds, AtomicBoolean stop,
-                IntConsumer progress, BiConsumer<MemoryNebula.Snapshot, String> done) {
+                Consumer<MemoryNebula.Progress> progress, BiConsumer<MemoryNebula.Snapshot, String> done) {
             NEBULA_WORKER.execute(() -> {
                 if (closingNebula) return;
                 String status;
                 try {
-                    nebula.collect(chatIds, history::messages, target.batchChars(), nebulaSummarizer(target),
-                        () -> closingNebula || stop.get(), count -> postNebula(() -> progress.accept(count)));
-                    status = stop.get() ? "已停止整理" : "整理完成";
+                    MemoryNebula.Progress finalProgress = nebula.collect(chatIds, history::messages, target.batchChars(),
+                        nebulaSummarizer(target), () -> closingNebula || stop.get(),
+                        value -> postNebula(() -> progress.accept(value)));
+                    status = stop.get() ? "已停止整理" : nebulaResult(finalProgress);
                 } catch (CancellationException error) {
                     status = "已停止整理";
                 } catch (Exception error) {
-                    status = "API 总结未完成，可再次整理";
+                    status = nebulaError(error);
                 }
                 MemoryNebula.Snapshot snapshot = nebulaSnapshot(nebula::snapshot);
                 String result = status;
                 postNebula(() -> done.accept(snapshot, result));
             });
+        }
+
+        private String nebulaResult(MemoryNebula.Progress progress) {
+            if (progress.unreadable > 0) {
+                String remaining = progress.deferred == 0 ? "" : "，另有 " + progress.deferred + " 条消息待重试";
+                return "已保存完成的批次，有 " + progress.unreadable + " 个对话无法读取" + remaining;
+            }
+            if (progress.deferred > 0) return "已保存完成的批次，剩余 " + progress.deferred + " 条消息可重试";
+            return progress.saved == 0 ? "没有需要整理的新消息" : "整理完成";
+        }
+
+        private String nebulaError(Exception error) {
+            if (error instanceof JSONException) return "API 未返回可用的摘要格式，可重试或切换模型";
+            if (error instanceof SocketTimeoutException) return "API 请求超时，可再次整理";
+            if (error instanceof DeepSeek.ApiError) {
+                DeepSeek.ApiError api = (DeepSeek.ApiError) error;
+                if (api.contextLimit) return "内容超过当前模型的上下文限制，可切换模型后再整理";
+                switch (api.status) {
+                    case 401: case 403: return "API 鉴权失败，请检查当前供应商的密钥和权限";
+                    case 402: return "API 余额不足，可充值后继续整理";
+                    case 408: case 504: return "API 请求超时，可再次整理";
+                    case 429: return "API 请求过于频繁，请稍后继续整理";
+                    case 400: case 404: case 422: return "API 拒绝了摘要请求，请检查模型和接口设置（HTTP " + api.status + "）";
+                    case 0:
+                        if ("请先配置当前 API".equals(api.getMessage())) return api.getMessage();
+                        break;
+                    default: break;
+                }
+                if (api.status >= 500) return "API 服务暂不可用，可稍后继续整理";
+            }
+            if (error instanceof IOException) return "无法完成 API 请求，请检查网络或代理后继续整理";
+            return "整理未完成，可再次整理";
         }
 
         private MemoryNebula.Summarize nebulaSummarizer(NebulaSummaries.Target target) {

@@ -7,6 +7,7 @@ import android.content.Context;
 import android.content.pm.PackageManager;
 import android.content.res.ColorStateList;
 import android.graphics.Bitmap;
+import android.graphics.Canvas;
 import android.graphics.Rect;
 import android.graphics.Typeface;
 import android.graphics.drawable.ColorDrawable;
@@ -91,6 +92,11 @@ final class NativeChat {
     private enum Motion { NONE, PUSH, POP, FADE }
     private static final PathInterpolator EASE = new PathInterpolator(.22f, .75f, .23f, 1f);
     private View screenView;
+    private final android.util.SparseArray<Bitmap> backPages = new android.util.SparseArray<>();
+    private ImageView backPeek;
+    private View backMoving;
+    private int renderedScreen = CHAT;
+    private boolean committingSystemBack;
     private HistoryDrawer drawer;
     private boolean settingsFromDrawer, apiFromSettings, managingHistory;
     private Dialog historyImportProgress;
@@ -110,6 +116,7 @@ final class NativeChat {
     private boolean nebulaWorking;
     private boolean nebulaHasLegacy;
     private AtomicBoolean nebulaStop;
+    private MemoryNebula.Progress nebulaProgressState;
     private int nebulaJobId;
     private Runnable nebulaAfterReply;
     private int nebulaLimit = 12;
@@ -118,7 +125,8 @@ final class NativeChat {
     private ScrollView nebulaScroll;
     private HorizontalScrollView nebulaFilterStrip;
     private LinearLayout nebulaFilters, nebulaCards;
-    private TextView nebulaCount, nebulaCaption, nebulaFeedback, nebulaScan, nebulaClear;
+    private ProgressBar nebulaProgressBar;
+    private TextView nebulaCount, nebulaCaption, nebulaRecords, nebulaFeedback, nebulaScan, nebulaClear;
     private int bg, surface, ink, muted, edge, blue, tint, blueSolid;
     private LinearLayout layout, messages, attachments, tools, attachmentPanel;
     private HorizontalScrollView attachmentStrip;
@@ -280,14 +288,26 @@ final class NativeChat {
     private void show(Motion motion, boolean reopenDrawer) {
         colors();
         View previous = screenView;
+        boolean continueBack = committingSystemBack && motion == Motion.POP && previous != null
+            && previous == backMoving && previous.getTranslationX() != 0f;
+        float exitDirection = continueBack ? Math.signum(previous.getTranslationX()) : 1f;
+        clearPageBackPreview(continueBack);
+        if (motion == Motion.PUSH && Build.VERSION.SDK_INT >= 34 && ValueAnimator.areAnimatorsEnabled()
+            && (state.data.optBoolean(PREDICTIVE_BACK) || screen == SETTINGS || screen == EXPERIMENTS)) {
+            captureBackPage(previous);
+        }
+        if (motion == Motion.POP) backPages.remove(renderedScreen);
+        if (screen == CHAT || motion == Motion.NONE) backPages.clear();
         for (int i = root.getChildCount() - 1; i >= 0; i--) {
             View child = root.getChildAt(i);
             child.animate().withEndAction(null).cancel();
             if (child != previous) root.removeView(child);
         }
-        if (previous != null) {
+        if (previous != null && !continueBack) {
             previous.setTranslationX(0);
             previous.setAlpha(1f);
+            previous.setScaleX(1f);
+            previous.setScaleY(1f);
         }
         layout = vertical();
         layout.setBackgroundColor(bg);
@@ -325,6 +345,7 @@ final class NativeChat {
             screenView = layout;
         }
         root.addView(screenView, new FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT));
+        renderedScreen = screen;
         if (screen == CHAT && reopenDrawer) drawer.restoreOpen();
         host.updateSystemBack();
         refreshBalance(false);
@@ -338,7 +359,8 @@ final class NativeChat {
         screenView.setAlpha(1f);
         if (motion == Motion.POP) {
             previous.bringToFront();
-            previous.animate().translationX(root.getWidth()).alpha(.8f).setInterpolator(EASE).setDuration(245)
+            previous.animate().translationX(root.getWidth() * exitDirection).alpha(.8f).setInterpolator(EASE)
+                .setDuration(continueBack ? 170 : 245)
                 .withEndAction(() -> root.removeView(previous)).start();
         } else {
             if (motion == Motion.PUSH) screenView.setTranslationX(root.getWidth());
@@ -370,13 +392,84 @@ final class NativeChat {
         return screen != CHAT || (drawer != null && drawer.isRevealed()) || attachmentPanelOpen || editing != null || voiceMode;
     }
 
-    void previewBack(float progress) {
-        if (screen == CHAT && drawer != null && !managingHistory && state.data.optBoolean(PREDICTIVE_BACK)
-            && ValueAnimator.areAnimatorsEnabled()) drawer.previewBack(progress);
+    private void captureBackPage(View page) {
+        if (page == null || page.getWidth() == 0 || page.getHeight() == 0) return;
+        float scale = Math.min(1f, 800f / Math.max(page.getWidth(), page.getHeight()));
+        Bitmap preview = Bitmap.createBitmap(Math.max(1, Math.round(page.getWidth() * scale)),
+            Math.max(1, Math.round(page.getHeight() * scale)), Bitmap.Config.ARGB_8888);
+        Canvas canvas = new Canvas(preview);
+        canvas.scale(scale, scale);
+        try {
+            page.draw(canvas);
+            backPages.put(screen, preview);
+        } catch (IllegalArgumentException | IllegalStateException cannotRender) {
+            backPages.remove(screen);
+            preview.recycle();
+        }
+    }
+
+    void previewBack(float progress, boolean fromRight) {
+        if (screenView == null || !state.data.optBoolean(PREDICTIVE_BACK) || !ValueAnimator.areAnimatorsEnabled()) return;
+        if (screen == CHAT) {
+            if (drawer != null && !managingHistory) drawer.previewBack(progress);
+            return;
+        }
+        float direction = fromRight ? -1f : 1f;
+        if (backMoving == null || progress == 0f) {
+            if (backMoving != null) {
+                backMoving.animate().withEndAction(null).cancel();
+                clearPageBackPreview(false);
+            }
+            backMoving = screenView;
+            backMoving.animate().withEndAction(null).cancel();
+            for (int i = root.getChildCount() - 1; i >= 0; i--) {
+                View child = root.getChildAt(i);
+                if (child != backMoving) {
+                    child.animate().withEndAction(null).cancel();
+                    root.removeViewAt(i);
+                }
+            }
+            Bitmap preview = backPages.get(screen);
+            if (preview != null) {
+                backPeek = new ImageView(context);
+                backPeek.setScaleType(ImageView.ScaleType.FIT_XY);
+                backPeek.setImageBitmap(preview);
+                backPeek.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+                root.addView(backPeek, 0, new FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT));
+            }
+        }
+        backMoving.setTranslationX(direction * root.getWidth() * .32f * progress);
+        backMoving.setScaleX(1f - .08f * progress);
+        backMoving.setScaleY(1f - .08f * progress);
+        backMoving.setAlpha(1f - .10f * progress);
+        if (backPeek != null) backPeek.setAlpha(.68f + .32f * progress);
     }
 
     void cancelBackPreview() {
-        if (screen == CHAT && drawer != null) drawer.cancelBackPreview();
+        if (screen == CHAT && drawer != null) {
+            drawer.cancelBackPreview();
+        } else if (backMoving != null) {
+            backMoving.animate().translationX(0).scaleX(1f).scaleY(1f).alpha(1f)
+                .setInterpolator(EASE).setDuration(160).withEndAction(() -> clearPageBackPreview(false)).start();
+        }
+    }
+
+    private void clearPageBackPreview(boolean keepPose) {
+        if (backPeek != null) root.removeView(backPeek);
+        backPeek = null;
+        if (backMoving != null && !keepPose) {
+            backMoving.setTranslationX(0);
+            backMoving.setScaleX(1f);
+            backMoving.setScaleY(1f);
+            backMoving.setAlpha(1f);
+        }
+        backMoving = null;
+    }
+
+    void commitSystemBack() {
+        committingSystemBack = true;
+        try { back(); }
+        finally { committingSystemBack = false; }
     }
 
     boolean back() {
@@ -2642,8 +2735,16 @@ final class NativeChat {
     private void openNebula() {
         if (!nebulaWorking) {
             nebulaWorking = true;
-            nebulaStatus = "正在读取记忆…";
-            services.readNebula(entries -> nebulaCompleted(entries, "", "无法读取本机记忆"));
+            if (nebulaProgressState == null) nebulaStatus = "正在读取记忆…";
+            services.readNebula(snapshot -> {
+                if (nebulaProgressState == null || snapshot == null) {
+                    nebulaCompleted(snapshot, "", "无法读取本机记忆");
+                } else {
+                    nebulaWorking = false;
+                    updateNebulaSnapshot(snapshot);
+                    renderNebula();
+                }
+            });
         }
         nebulaCategory = null;
         nebulaLimit = 12;
@@ -2678,10 +2779,7 @@ final class NativeChat {
         FrameLayout sky = new FrameLayout(context);
         sky.setBackground(box(0xff141c35, 0, 23));
         sky.setClipToOutline(true);
-        nebulaSky = new NebulaSky(context, kind -> {
-            chooseNebulaCategory(kind);
-            if (!wide) nebulaScroll.smoothScrollTo(0, Math.max(0, nebulaFilterStrip.getTop() - dp(9)));
-        });
+        nebulaSky = new NebulaSky(context, this::chooseNebulaCategory);
         sky.addView(nebulaSky, MATCH_PARENT, MATCH_PARENT);
         LinearLayout summary = vertical();
         pad(summary, 19, 15);
@@ -2692,10 +2790,20 @@ final class NativeChat {
         summary.addView(nebulaCount, WRAP_CONTENT, WRAP_CONTENT);
         sky.addView(summary, new FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.TOP | Gravity.START));
         nebulaCaption = text("", 12, 0xffc2cee7);
-        FrameLayout.LayoutParams caption = new FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.BOTTOM | Gravity.START);
-        caption.setMarginStart(dp(19));
-        caption.bottomMargin = dp(15);
-        sky.addView(nebulaCaption, caption);
+        nebulaCaption.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
+        LinearLayout skyFooter = horizontal();
+        pad(skyFooter, 15, 5);
+        skyFooter.addView(nebulaCaption, new LinearLayout.LayoutParams(0, WRAP_CONTENT, 1));
+        nebulaRecords = action("查看记录 ↓", () -> {
+            Rect area = new Rect();
+            nebulaFilterStrip.getDrawingRect(area);
+            nebulaScroll.offsetDescendantRectToMyCoords(nebulaFilterStrip, area);
+            nebulaScroll.smoothScrollTo(0, Math.max(0, area.top - dp(9)));
+        });
+        nebulaRecords.setTextColor(0xffbdd7ff);
+        nebulaRecords.setTextSize(12);
+        skyFooter.addView(nebulaRecords, WRAP_CONTENT, dp(44));
+        sky.addView(skyFooter, new FrameLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT, Gravity.BOTTOM));
         overview.addView(sky, MATCH_PARENT, dp(242));
 
         LinearLayout management = settingsGroup(overview, "整理与管理");
@@ -2718,6 +2826,15 @@ final class NativeChat {
         management.addView(actions, MATCH_PARENT, WRAP_CONTENT);
         settingsNote(overview, "整理时会把你发出的部分文字交给当前配置的 " + state.providerName(state.apiProvider())
             + " API。摘要只保存在本机，与对话记录独立，不参与聊天回复。");
+        nebulaProgressBar = new ProgressBar(context, null, android.R.attr.progressBarStyleHorizontal);
+        nebulaProgressBar.setProgressTintList(ColorStateList.valueOf(blue));
+        nebulaProgressBar.setProgressBackgroundTintList(ColorStateList.valueOf(edge));
+        nebulaProgressBar.setIndeterminateTintList(ColorStateList.valueOf(blue));
+        nebulaProgressBar.setMax(1000);
+        nebulaProgressBar.setContentDescription("对话整理进度");
+        LinearLayout.LayoutParams progressSpace = new LinearLayout.LayoutParams(MATCH_PARENT, dp(8));
+        progressSpace.setMargins(dp(3), dp(7), dp(3), dp(3));
+        overview.addView(nebulaProgressBar, progressSpace);
         nebulaFeedback = text("", 13, muted);
         pad(nebulaFeedback, 3, 5);
         nebulaFeedback.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
@@ -2745,15 +2862,13 @@ final class NativeChat {
         if (screen != NEBULA || nebulaSky == null) return;
         int[] counts = new int[MemoryNebula.Kind.values().length];
         for (MemoryNebula.Entry entry : nebulaEntries) counts[entry.kind.ordinal()]++;
-        int active = 0;
-        for (int count : counts) if (count > 0) active++;
         nebulaSky.update(counts, nebulaCategory);
         nebulaCount.setText(nebulaEntries.size() + " 条记忆");
-        nebulaCaption.setText("分布在 " + active + " 个类别");
-        nebulaCaption.setVisibility(active == 0 ? View.GONE : View.VISIBLE);
-        String feedback = nebulaStatus.isEmpty() && nebulaHasLegacy ? "有旧星云记录等待重新总结" : nebulaStatus;
-        nebulaFeedback.setText(feedback);
-        nebulaFeedback.setVisibility(feedback.isEmpty() ? View.GONE : View.VISIBLE);
+        nebulaCaption.setText(nebulaCategory == null
+            ? nebulaEntries.isEmpty() ? "横向拖动星图" : "横向拖动 · 点按星点"
+            : nebulaCategory.label + " · " + counts[nebulaCategory.ordinal()] + " 条记忆");
+        nebulaRecords.setVisibility(nebulaEntries.isEmpty() ? View.GONE : View.VISIBLE);
+        renderNebulaProgress();
         nebulaScan.setText(nebulaStop == null ? "整理已有对话" : nebulaStop.get() ? "正在停止…" : "停止整理");
         enableHistoryButton(nebulaScan, !nebulaWorking || (nebulaStop != null && !nebulaStop.get()));
         enableHistoryButton(nebulaClear, !nebulaWorking && (!nebulaEntries.isEmpty() || nebulaHasLegacy));
@@ -2777,6 +2892,26 @@ final class NativeChat {
                 renderNebula();
             }), MATCH_PARENT, WRAP_CONTENT);
         }
+    }
+
+    private void renderNebulaProgress() {
+        if (screen != NEBULA || nebulaProgressBar == null) return;
+        MemoryNebula.Progress state = nebulaProgressState;
+        String feedback = nebulaStatus.isEmpty() && nebulaHasLegacy ? "有旧星云记录等待重新总结" : nebulaStatus;
+        nebulaProgressBar.setVisibility(state == null ? View.GONE : View.VISIBLE);
+        if (state != null) {
+            boolean running = nebulaStop != null;
+            nebulaProgressBar.setIndeterminate(state.totalChats == 0 && running);
+            int fraction = state.totalChats == 0 ? 1000 : (int) (1000L * state.scanned / state.totalChats);
+            nebulaProgressBar.setProgress(running ? Math.min(fraction, 980) : fraction, ValueAnimator.areAnimatorsEnabled());
+            String counts = (state.totalChats == 0 ? "" : "已扫描 " + state.scanned + " / " + state.totalChats + " 个对话 · ")
+                + "本次已整理 " + state.saved + " 条消息 / " + state.batches + " 批";
+            if (state.requesting && running && !nebulaStop.get()) counts += "\n正在调用 API 整理下一批…";
+            if (!feedback.isEmpty()) counts += "\n" + feedback;
+            feedback = counts;
+        }
+        nebulaFeedback.setText(feedback);
+        nebulaFeedback.setVisibility(feedback.isEmpty() ? View.GONE : View.VISIBLE);
     }
 
     private void addNebulaFilter(MemoryNebula.Kind kind, String name) {
@@ -2840,7 +2975,7 @@ final class NativeChat {
     private void collectNebula() {
         if (nebulaStop != null) {
             nebulaStop.set(true);
-            nebulaStatus = "正在保存已完成的摘要…";
+            nebulaStatus = "等待当前批次完成…";
             renderNebula();
             return;
         }
@@ -2858,12 +2993,13 @@ final class NativeChat {
         }
         nebulaWorking = true;
         nebulaStop = new AtomicBoolean();
-        nebulaStatus = "正在调用 API 总结…";
+        nebulaProgressState = new MemoryNebula.Progress(0, ids.size(), 0, 0, 0, 0, false);
+        nebulaStatus = "正在读取历史…";
         renderNebula();
-        services.collectNebula(target, ids, nebulaStop, count -> {
-            if (nebulaStop == null || nebulaStop.get()) return;
-            nebulaStatus = "已处理 " + count + " 条，继续整理中…";
-            if (screen == NEBULA) nebulaFeedback.setText(nebulaStatus);
+        services.collectNebula(target, ids, nebulaStop, progress -> {
+            nebulaProgressState = progress;
+            if (!nebulaStop.get()) nebulaStatus = "";
+            renderNebulaProgress();
         }, (snapshot, status) -> {
             nebulaStop = null;
             nebulaWorking = false;
@@ -2883,6 +3019,7 @@ final class NativeChat {
             dialog.dismiss();
             if (nebulaWorking) return;
             nebulaWorking = true;
+            nebulaProgressState = null;
             nebulaStatus = "正在保存…";
             renderNebula();
             services.deleteNebula(all ? null : entry.id,
@@ -2924,7 +3061,7 @@ final class NativeChat {
         LinearLayout gestures = settingsGroup(body, "手势");
         experimentSwitch(gestures, R.drawable.ic_back, "预测性返回", PREDICTIVE_BACK, 34);
         settingsNote(body, Build.VERSION.SDK_INT >= 34
-            ? "使用系统返回手势时，侧栏和面板会随手势收起。取消手势可回到原位。"
+            ? "开启后，从屏幕边缘滑动可预览上一页，或逐步收起侧栏和弹窗。松手取消时会恢复原位。"
             : "应用内返回预览需要 Android 14 或更新版本。");
 
         LinearLayout panels = settingsGroup(body, "视觉效果");

@@ -5,7 +5,9 @@ import android.content.Context;
 import android.database.Cursor;
 import android.database.sqlite.SQLiteDatabase;
 import android.database.sqlite.SQLiteOpenHelper;
+import android.os.SystemClock;
 import android.util.Base64;
+import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -17,7 +19,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CancellationException;
 import java.util.function.BooleanSupplier;
-import java.util.function.IntConsumer;
+import java.util.function.Consumer;
 import java.util.regex.Pattern;
 import org.json.JSONArray;
 import org.json.JSONException;
@@ -27,7 +29,7 @@ import static com.jingliu.chat.ChatState.string;
 
 final class MemoryNebula extends SQLiteOpenHelper {
     private static final int MAX_SOURCE_CHARS = 1000;
-    private static final int MAX_BATCH_MESSAGES = 24;
+    private static final int MAX_BATCH_MESSAGES = 8;
     private static final Pattern SENTENCES = Pattern.compile("(?<=[。！？!?；;])|\\n+|(?<=\\.)\\s+");
     private static final Pattern SENSITIVE = Pattern.compile(
         "(?iu)(密码|口令|验证码|身份证|护照|银行卡|住址|家庭地址|手机号|私钥|助记词|病例|病历|确诊|支付密码|密钥|访问令牌|"
@@ -69,6 +71,21 @@ final class MemoryNebula extends SQLiteOpenHelper {
         Snapshot(List<Entry> entries, boolean hasLegacy) {
             this.entries = entries;
             this.hasLegacy = hasLegacy;
+        }
+    }
+
+    static final class Progress {
+        final int scanned, totalChats, saved, batches, deferred, unreadable;
+        final boolean requesting;
+
+        Progress(int scanned, int totalChats, int saved, int batches, int deferred, int unreadable, boolean requesting) {
+            this.scanned = scanned;
+            this.totalChats = totalChats;
+            this.saved = saved;
+            this.batches = batches;
+            this.deferred = deferred;
+            this.unreadable = unreadable;
+            this.requesting = requesting;
         }
     }
 
@@ -127,24 +144,33 @@ final class MemoryNebula extends SQLiteOpenHelper {
 
     void remember(String chatId, int index, String text, int batchChars, Summarize summarize, BooleanSupplier cancelled)
             throws Exception {
-        Batch batch = new Batch(batchChars, summarize, cancelled, ignored -> {});
+        Batch batch = new Batch(batchChars, summarize, cancelled, null, 0);
         batch.add(source(chatId, index, text, batchChars));
         batch.flush();
     }
 
-    void collect(List<String> chatIds, Messages messages, int batchChars, Summarize summarize, BooleanSupplier cancelled,
-            IntConsumer progress) throws Exception {
-        Batch batch = new Batch(batchChars, summarize, cancelled, progress);
+    Progress collect(List<String> chatIds, Messages messages, int batchChars, Summarize summarize, BooleanSupplier cancelled,
+            Consumer<Progress> progress) throws Exception {
+        Batch batch = new Batch(batchChars, summarize, cancelled, progress, chatIds.size());
         for (String id : chatIds) {
             batch.checkCancelled();
-            JSONArray chat = messages.read(id);
-            if (chat == null) continue;
-            for (int index = 0; index < chat.length(); index++) {
-                JSONObject message = chat.optJSONObject(index);
-                if ("user".equals(string(message, "role"))) {
-                    batch.add(source(id, index, string(message, "text"), batchChars));
+            JSONArray chat;
+            try {
+                chat = messages.read(id);
+            } catch (JSONException error) {
+                chat = null;
+                batch.unreadable++;
+            }
+            if (chat != null) {
+                for (int index = 0; index < chat.length(); index++) {
+                    JSONObject message = chat.optJSONObject(index);
+                    if ("user".equals(string(message, "role"))) {
+                        batch.add(source(id, index, string(message, "text"), batchChars));
+                    }
                 }
             }
+            batch.scanned++;
+            batch.publish(false, false);
         }
         List<Source> legacy = new ArrayList<>();
         try (Cursor rows = batch.database.rawQuery("SELECT id, text FROM legacy_notes ORDER BY rowid", null)) {
@@ -155,6 +181,7 @@ final class MemoryNebula extends SQLiteOpenHelper {
         }
         for (Source source : legacy) batch.add(source);
         batch.flush();
+        return batch.publish(false, true);
     }
 
     void remove(String id) {
@@ -185,14 +212,17 @@ final class MemoryNebula extends SQLiteOpenHelper {
         final int limit;
         final Summarize summarize;
         final BooleanSupplier cancelled;
-        final IntConsumer progress;
-        int chars, processed;
+        final Consumer<Progress> progress;
+        final int totalChats;
+        int chars, scanned, saved, batches, deferred, unreadable, consecutiveFailures;
+        long lastProgress;
 
-        Batch(int limit, Summarize summarize, BooleanSupplier cancelled, IntConsumer progress) {
+        Batch(int limit, Summarize summarize, BooleanSupplier cancelled, Consumer<Progress> progress, int totalChats) {
             this.limit = limit;
             this.summarize = summarize;
             this.cancelled = cancelled;
             this.progress = progress;
+            this.totalChats = totalChats;
         }
 
         void checkCancelled() {
@@ -215,25 +245,63 @@ final class MemoryNebula extends SQLiteOpenHelper {
         void flush() throws Exception {
             checkCancelled();
             if (pending.isEmpty()) return;
+            summarizeAndSave(pending);
+            pending.clear();
+            ids.clear();
+            chars = 0;
+        }
+
+        Progress publish(boolean requesting, boolean force) {
+            long now = SystemClock.elapsedRealtime();
+            if (!force && (progress == null || now - lastProgress < 150)) return null;
+            lastProgress = now;
+            Progress value = new Progress(scanned, totalChats, saved, batches, deferred, unreadable, requesting);
+            if (progress != null) progress.accept(value);
+            return value;
+        }
+
+        private void summarizeAndSave(List<Source> sources) throws Exception {
+            checkCancelled();
             List<String> inputs = new ArrayList<>();
-            for (Source source : pending) inputs.add(source.text);
-            List<NebulaSummaries.Summary> summaries = summarize.run(inputs);
+            for (Source source : sources) inputs.add(source.text);
+            if (progress != null) publish(true, true);
+            List<NebulaSummaries.Summary> summaries;
+            try {
+                summaries = summarize.run(inputs);
+            } catch (Exception error) {
+                checkCancelled();
+                if (progress == null || !splittable(error)) throw error;
+                if (sources.size() > 1) {
+                    int middle = sources.size() / 2;
+                    summarizeAndSave(sources.subList(0, middle));
+                    summarizeAndSave(sources.subList(middle, sources.size()));
+                } else {
+                    if (error instanceof SocketTimeoutException || ++consecutiveFailures >= 3) throw error;
+                    deferred++;
+                    publish(false, true);
+                }
+                return;
+            }
             database.beginTransaction();
             try {
                 long now = System.currentTimeMillis();
                 for (NebulaSummaries.Summary summary : summaries) store(database, summary, now);
-                for (Source source : pending) {
+                for (Source source : sources) {
                     if (source.legacy) database.delete("legacy_notes", "id=?", new String[]{source.id});
                     else mark(database, "seen", source.id);
                 }
                 database.setTransactionSuccessful();
             } finally { database.endTransaction(); }
-            processed += pending.size();
-            progress.accept(processed);
-            pending.clear();
-            ids.clear();
-            chars = 0;
+            saved += sources.size();
+            batches++;
+            consecutiveFailures = 0;
+            if (progress != null) publish(false, true);
         }
+    }
+
+    private static boolean splittable(Exception error) {
+        return error instanceof JSONException || error instanceof SocketTimeoutException
+            || (error instanceof DeepSeek.ApiError && ((DeepSeek.ApiError) error).contextLimit);
     }
 
     private static void store(SQLiteDatabase database, NebulaSummaries.Summary summary, long now) {

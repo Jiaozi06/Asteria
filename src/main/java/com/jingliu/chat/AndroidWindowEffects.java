@@ -10,10 +10,11 @@ import android.window.BackEvent;
 import android.window.OnBackAnimationCallback;
 import android.window.OnBackInvokedCallback;
 import android.window.OnBackInvokedDispatcher;
+import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 
 final class AndroidWindowEffects {
-    static Runnable registerBack(Window window, Runnable commit, Consumer<Float> preview, Runnable cancel) {
+    static Runnable registerBack(Window window, Runnable commit, BiConsumer<Float, Boolean> preview, Runnable cancel) {
         OnBackInvokedDispatcher dispatcher = window.getOnBackInvokedDispatcher();
         OnBackInvokedCallback callback = Build.VERSION.SDK_INT >= 34 && preview != null
             ? PredictiveBack.callback(commit, preview, cancel) : commit::run;
@@ -22,7 +23,7 @@ final class AndroidWindowEffects {
     }
 
     static void animatePanelBack(Dialog dialog, Window window, View panel, boolean bottom, int travel) {
-        Runnable unregister = registerBack(window, dialog::cancel, progress -> {
+        Runnable unregister = registerBack(window, dialog::cancel, (progress, fromRight) -> {
             if (!ValueAnimator.areAnimatorsEnabled()) return;
             panel.animate().cancel();
             if (bottom) panel.setTranslationY(travel * progress);
@@ -60,10 +61,12 @@ final class AndroidWindowEffects {
     }
 
     private static final class PredictiveBack {
-        static OnBackInvokedCallback callback(Runnable commit, Consumer<Float> preview, Runnable cancel) {
+        static OnBackInvokedCallback callback(Runnable commit, BiConsumer<Float, Boolean> preview, Runnable cancel) {
             return new OnBackAnimationCallback() {
-                @Override public void onBackStarted(BackEvent event) { preview.accept(0f); }
-                @Override public void onBackProgressed(BackEvent event) { preview.accept(event.getProgress()); }
+                @Override public void onBackStarted(BackEvent event) { preview.accept(0f, event.getSwipeEdge() == BackEvent.EDGE_RIGHT); }
+                @Override public void onBackProgressed(BackEvent event) {
+                    preview.accept(event.getProgress(), event.getSwipeEdge() == BackEvent.EDGE_RIGHT);
+                }
                 @Override public void onBackCancelled() { cancel.run(); }
                 @Override public void onBackInvoked() { commit.run(); }
             };

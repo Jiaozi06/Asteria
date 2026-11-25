@@ -23,7 +23,7 @@ final class NebulaSummaries {
         + "性格仅归纳用户明确的自我描述，不猜测人格或敏感身份。区分明确偏好和仅聊到的话题，保留原有否定含义。"
         + "忽略账号、密码、联系方式、住址、疾病等敏感信息，以及虚构、假设和角色扮演。"
         + "相近内容合并成一条，subject 使用稳定的名词或短语作为同义归并键，例如养猫、晨跑。"
-        + "每条写一个简短标题和一句有信息的摘要。返回单个 JSON 对象，最多 16 条。无可记录内容时返回 {\"memories\":[]}。"
+        + "每条写一个 20 字以内的标题和一句 60 字以内的摘要。返回单个 JSON 对象，最多 8 条。无可记录内容时返回 {\"memories\":[]}。"
         + "格式为 {\"memories\":[{\"kind\":\"TOPIC|PREFERENCE|HABIT|PERSONALITY|DETAIL\",\"subject\":\"晨跑\","
         + "\"title\":\"晨跑习惯\",\"summary\":\"有规律的晨跑习惯。\",\"sources\":[1]}]}。sources 只填写支持这条摘要的输入编号。";
 
@@ -42,11 +42,11 @@ final class NebulaSummaries {
         }
 
         int outputTokens() {
-            return contextWindow > 0 ? Math.min(1800, Math.max(256, contextWindow / 4)) : 1800;
+            return contextWindow > 0 ? Math.min(2400, Math.max(256, contextWindow / 4)) : 2400;
         }
 
         int batchChars() {
-            return contextWindow > 0 ? Math.min(10_000, Math.max(360, (contextWindow - outputTokens() - 750) / 2)) : 10_000;
+            return contextWindow > 0 ? Math.min(4800, Math.max(360, (contextWindow - outputTokens() - 750) / 2)) : 4800;
         }
     }
 
@@ -70,9 +70,13 @@ final class NebulaSummaries {
         boolean nativeDeepSeek = target.protocol.deepSeek(target.endpoint);
         JSONArray messages = new JSONArray();
         if (!nativeDeepSeek) messages.put(json("role", "system", "content", INSTRUCTIONS));
-        messages.put(json("role", "user", "content", data));
+        Object content = nativeDeepSeek ? new JSONArray().put(json("type", "text", "text", data)) : data;
+        messages.put(json("role", "user", "content", content));
         JSONObject body = json("model", target.model, "stream", false, "messages", messages);
-        if (nativeDeepSeek) put(body, "system", INSTRUCTIONS);
+        if (nativeDeepSeek) {
+            put(body, "system", INSTRUCTIONS);
+            put(body, "thinking", json("type", "disabled"));
+        }
         put(body, target.protocol == ApiProtocol.OPENAI ? "max_completion_tokens" : "max_tokens", target.outputTokens());
         if (target.protocol == ApiProtocol.GEMINI || target.protocol == ApiProtocol.OLLAMA) {
             put(body, "response_format", json("type", "json_object"));
@@ -133,31 +137,57 @@ final class NebulaSummaries {
         JSONArray memories = ((JSONObject) root).getJSONArray("memories");
         if (memories.length() > 16) throw invalid();
         Map<String, Summary> result = new LinkedHashMap<>();
+        int parsed = 0;
         for (int i = 0; i < memories.length(); i++) {
-            JSONObject item = memories.getJSONObject(i);
-            MemoryNebula.Kind kind;
-            try { kind = MemoryNebula.Kind.valueOf(item.getString("kind")); }
-            catch (IllegalArgumentException error) { throw invalid(); }
-            String subject = canonical(cleanText(item, "subject", 36));
-            String title = cleanText(item, "title", 40);
-            String detail = cleanText(item, "summary", 116);
-            if (subject.isEmpty() || detail.matches("(?iu)^[‘’“”\"「『\\s]*(?:我|i\\b).*")
-                || MemoryNebula.sensitive(subject + " " + title + " " + detail)) throw invalid();
-            JSONArray sources = item.getJSONArray("sources");
-            if (sources.length() == 0 || sources.length() > inputs.size()) throw invalid();
-            Summary summary = result.computeIfAbsent(kind.name() + '\n' + subject,
-                unused -> new Summary(kind, subject, title, detail));
-            for (int j = 0; j < sources.length(); j++) {
-                Object source = sources.opt(j);
-                if (!(source instanceof Number)) throw invalid();
-                int index = ((Number) source).intValue() - 1;
-                if (index < 0 || index >= inputs.size() || ((Number) source).doubleValue() != index + 1) throw invalid();
-                String original = canonical(inputs.get(index));
-                if (copied(original, canonical(title)) || copied(original, canonical(detail))) throw invalid();
-                summary.sources.add(index);
+            Summary item;
+            try { item = parseItem(memories.getJSONObject(i), inputs); }
+            catch (JSONException error) { continue; }
+            parsed++;
+            if (item != null) {
+                Summary prior = result.putIfAbsent(item.kind.name() + '\n' + item.subject, item);
+                if (prior != null) prior.sources.addAll(item.sources);
             }
         }
+        if (parsed == 0 && memories.length() > 0) throw invalid();
         return new ArrayList<>(result.values());
+    }
+
+    private static Summary parseItem(JSONObject item, List<String> inputs) throws JSONException {
+        MemoryNebula.Kind kind;
+        try { kind = MemoryNebula.Kind.valueOf(item.getString("kind").trim().toUpperCase(Locale.ROOT)); }
+        catch (IllegalArgumentException error) { throw invalid(); }
+        String subject = canonical(cleanText(item, "subject", 36));
+        String title = cleanText(item, "title", 40);
+        String detail = cleanText(item, "summary", 116);
+        if (subject.isEmpty()) throw invalid();
+        if (detail.matches("(?iu)^[‘’“”\"「『\\s]*(?:我|i\\b).*")
+            || MemoryNebula.sensitive(subject + " " + title + " " + detail)) return null;
+        JSONArray sources = item.getJSONArray("sources");
+        if (sources.length() == 0) throw invalid();
+        Summary summary = new Summary(kind, subject, title, detail);
+        String titleKey = canonical(title), detailKey = canonical(detail);
+        for (int j = 0; j < sources.length(); j++) {
+            Object source = sources.opt(j);
+            int index = sourceIndex(source, inputs.size());
+            String original = canonical(inputs.get(index));
+            if ((titleKey.length() >= 8 && copied(original, titleKey)) || copied(original, detailKey)) return null;
+            summary.sources.add(index);
+        }
+        return summary;
+    }
+
+    private static int sourceIndex(Object value, int size) throws JSONException {
+        if (value instanceof Number) {
+            double number = ((Number) value).doubleValue();
+            if (number >= 1 && number <= size && number == (int) number) return (int) number - 1;
+        } else if (value instanceof String) {
+            String number = ((String) value).trim();
+            if (number.matches("[1-9][0-9]{0,2}")) {
+                int index = Integer.parseInt(number) - 1;
+                if (index < size) return index;
+            }
+        }
+        throw invalid();
     }
 
     private static String canonical(String value) {
