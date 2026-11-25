@@ -89,6 +89,7 @@ final class NativeChat {
     private static final int NEBULA = 9;
     private static final String PREDICTIVE_BACK = "experimentalPredictiveBack";
     private static final String BLUR_PANELS = "experimentalBlurPanels";
+    private static final String GLASS_COMPOSER = "experimentalGlassComposer";
     private enum Motion { NONE, PUSH, POP, FADE }
     private enum NebulaRange {
         DAY(1, "最近 1 天"), WEEK(7, "最近 7 天"), MONTH(30, "最近 30 天"), ALL(0, "全部");
@@ -729,11 +730,26 @@ final class NativeChat {
         content.addView(messages, MATCH_PARENT, WRAP_CONTENT);
         LinearLayout footer = chatFooter = vertical();
         pad(footer, 13, 0);
-        layout.addView(footer, MATCH_PARENT, WRAP_CONTENT);
+        boolean glass = state.data.optBoolean(GLASS_COMPOSER) && GlassComposer.supported();
+        if (glass) {
+            chatBody.addView(footer, new FrameLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT, Gravity.BOTTOM));
+            ScrollView scroll = transcript;
+            footer.addOnLayoutChangeListener((view, l, t, r, b, ol, ot, or, ob) -> {
+                if (transcript != scroll || content.getPaddingBottom() == b - t) return;
+                boolean follow = nearBottom();
+                int overlap = b - t;
+                content.setPadding(0, 0, 0, overlap);
+                jump.bottomMargin = overlap + dp(10);
+                returnBottom.setLayoutParams(jump);
+                if (follow) bottom();
+            });
+        } else {
+            layout.addView(footer, MATCH_PARENT, WRAP_CONTENT);
+        }
 
-        LinearLayout composer = vertical();
+        LinearLayout composer = glass ? new GlassComposer(context, dark, surface, edge, dp(20)) : vertical();
         pad(composer, 7, 5);
-        composer.setBackground(box(surface, edge, 20));
+        if (!glass) composer.setBackground(box(surface, edge, 20));
         footer.addView(composer, MATCH_PARENT, WRAP_CONTENT);
         editHeader = horizontal();
         editHeader.setBackground(box(dark ? 0xff252e40 : 0xffeaf2ff, 0, 13));
@@ -848,6 +864,7 @@ final class NativeChat {
         };
         footnote.addView(note, WRAP_CONTENT, WRAP_CONTENT);
         footnote.addView(balance, WRAP_CONTENT, WRAP_CONTENT);
+        if (glass) footnote.setBackground(box(dark ? 0xeb121722 : 0xedffffff, 0, 7));
         footer.addView(footnote, MATCH_PARENT, WRAP_CONTENT);
         updateBalanceFooter();
 
@@ -3098,13 +3115,13 @@ final class NativeChat {
         scroll.addView(body, MATCH_PARENT, WRAP_CONTENT);
 
         LinearLayout gestures = settingsGroup(body, "手势");
-        experimentSwitch(gestures, R.drawable.ic_back, "预测性返回", PREDICTIVE_BACK, 34);
+        experimentSwitch(gestures, R.drawable.ic_back, "预测性返回", PREDICTIVE_BACK, Build.VERSION.SDK_INT >= 34);
         settingsNote(body, Build.VERSION.SDK_INT >= 34
             ? "开启后，从屏幕边缘滑动可预览上一页，或逐步收起侧栏和弹窗。松手取消时会恢复原位。"
             : "应用内返回预览需要 Android 14 或更新版本。");
 
         LinearLayout panels = settingsGroup(body, "视觉效果");
-        experimentSwitch(panels, R.drawable.ic_theme, "弹窗毛玻璃", BLUR_PANELS, 31);
+        experimentSwitch(panels, R.drawable.ic_theme, "弹窗毛玻璃", BLUR_PANELS, Build.VERSION.SDK_INT >= 31);
         if (Build.VERSION.SDK_INT >= 31) {
             divider(panels);
             settingsRow(panels, R.drawable.ic_insight, "预览弹窗", "", () -> composerNotice("效果预览",
@@ -3113,16 +3130,20 @@ final class NativeChat {
         settingsNote(body, Build.VERSION.SDK_INT >= 31
             ? "设备或系统暂时停用窗口模糊时，弹窗会使用普通遮罩。"
             : "弹窗毛玻璃需要 Android 12 或更新版本。");
+        LinearLayout chat = settingsGroup(body, "聊天输入栏");
+        boolean glass = GlassComposer.supported();
+        experimentSwitch(chat, R.drawable.ic_theme, "输入栏玻璃效果", GLASS_COMPOSER, glass);
+        settingsNote(body, glass ? "开启后，滚动经过输入栏下方的聊天内容会实时模糊，按压时会出现柔和的高光。"
+            : "输入栏玻璃效果需要 Android 17 QPR2（API 37.2）或更新版本。");
     }
 
-    private void experimentSwitch(LinearLayout group, int icon, String label, String key, int minSdk) {
+    private void experimentSwitch(LinearLayout group, int icon, String label, String key, boolean available) {
         LinearLayout row = settingsLine(group, icon);
         Switch toggle = new Switch(context);
         toggle.setText(label);
         toggle.setTextColor(ink);
         toggle.setTextSize(15);
         toggle.setPaddingRelative(dp(11), 0, 0, 0);
-        boolean available = Build.VERSION.SDK_INT >= minSdk;
         toggle.setEnabled(available);
         toggle.setAlpha(available ? 1f : .55f);
         toggle.setChecked(available && state.data.optBoolean(key));

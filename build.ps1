@@ -8,10 +8,10 @@ if (!$SdkRoot) { $SdkRoot = $env:ANDROID_SDK_ROOT }
 if (!$SdkRoot -or !$JavaHome) { throw 'Set ANDROID_HOME and JAVA_HOME, or pass -SdkRoot and -JavaHome.' }
 $env:JAVA_HOME = $JavaHome
 $env:Path = "$JavaHome/bin;$env:Path"
-$tool = Join-Path $SdkRoot 'build-tools/35.0.0'
-$android = Join-Path $SdkRoot 'platforms/android-35/android.jar'
-if (!(Test-Path $android)) { throw 'Install Android SDK platform 35.' }
-if (!(Test-Path (Join-Path $tool 'aapt2.exe'))) { throw 'Install Android SDK build-tools 35.0.0.' }
+$tool = Join-Path $SdkRoot 'build-tools/37.0.0'
+$android = Join-Path $SdkRoot 'platforms/android-37.2/android.jar'
+if (!(Test-Path $android)) { throw 'Install Android SDK platform 37.2.' }
+if (!(Test-Path (Join-Path $tool 'aapt2.exe'))) { throw 'Install Android SDK build-tools 37.0.0.' }
 
 function Invoke-Tool {
     param([string]$File, [string[]]$Arguments)
