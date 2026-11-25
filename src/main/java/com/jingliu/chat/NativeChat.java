@@ -126,7 +126,7 @@ final class NativeChat {
     private HorizontalScrollView nebulaFilterStrip;
     private LinearLayout nebulaFilters, nebulaCards;
     private ProgressBar nebulaProgressBar;
-    private TextView nebulaCount, nebulaCaption, nebulaRecords, nebulaFeedback, nebulaScan, nebulaClear;
+    private TextView nebulaCount, nebulaRecords, nebulaFeedback, nebulaScan, nebulaClear;
     private int bg, surface, ink, muted, edge, blue, tint, blueSolid;
     private LinearLayout layout, messages, attachments, tools, attachmentPanel;
     private HorizontalScrollView attachmentStrip;
@@ -2779,7 +2779,7 @@ final class NativeChat {
         FrameLayout sky = new FrameLayout(context);
         sky.setBackground(box(0xff141c35, 0, 23));
         sky.setClipToOutline(true);
-        nebulaSky = new NebulaSky(context, this::chooseNebulaCategory);
+        nebulaSky = new NebulaSky(context, this::showNebulaMemory);
         sky.addView(nebulaSky, MATCH_PARENT, MATCH_PARENT);
         LinearLayout summary = vertical();
         pad(summary, 19, 15);
@@ -2789,11 +2789,6 @@ final class NativeChat {
         bold(nebulaCount);
         summary.addView(nebulaCount, WRAP_CONTENT, WRAP_CONTENT);
         sky.addView(summary, new FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.TOP | Gravity.START));
-        nebulaCaption = text("", 12, 0xffc2cee7);
-        nebulaCaption.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
-        LinearLayout skyFooter = horizontal();
-        pad(skyFooter, 15, 5);
-        skyFooter.addView(nebulaCaption, new LinearLayout.LayoutParams(0, WRAP_CONTENT, 1));
         nebulaRecords = action("查看记录 ↓", () -> {
             Rect area = new Rect();
             nebulaFilterStrip.getDrawingRect(area);
@@ -2802,8 +2797,11 @@ final class NativeChat {
         });
         nebulaRecords.setTextColor(0xffbdd7ff);
         nebulaRecords.setTextSize(12);
-        skyFooter.addView(nebulaRecords, WRAP_CONTENT, dp(44));
-        sky.addView(skyFooter, new FrameLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT, Gravity.BOTTOM));
+        FrameLayout.LayoutParams recordsPosition = new FrameLayout.LayoutParams(WRAP_CONTENT, dp(44),
+            Gravity.BOTTOM | Gravity.END);
+        recordsPosition.setMarginEnd(dp(15));
+        recordsPosition.bottomMargin = dp(5);
+        sky.addView(nebulaRecords, recordsPosition);
         overview.addView(sky, MATCH_PARENT, dp(242));
 
         LinearLayout management = settingsGroup(overview, "整理与管理");
@@ -2858,15 +2856,17 @@ final class NativeChat {
         renderNebula();
     }
 
+    private void showNebulaMemory(MemoryNebula.Entry entry) {
+        Dialog dialog = newSheet();
+        LinearLayout panel = settingsSheet(dialog, entry.title);
+        settingsNote(panel, entry.detail);
+        showSheet(dialog, panel);
+    }
+
     private void renderNebula() {
         if (screen != NEBULA || nebulaSky == null) return;
-        int[] counts = new int[MemoryNebula.Kind.values().length];
-        for (MemoryNebula.Entry entry : nebulaEntries) counts[entry.kind.ordinal()]++;
-        nebulaSky.update(counts, nebulaCategory);
+        nebulaSky.update(nebulaEntries);
         nebulaCount.setText(nebulaEntries.size() + " 条记忆");
-        nebulaCaption.setText(nebulaCategory == null
-            ? nebulaEntries.isEmpty() ? "横向拖动星图" : "横向拖动 · 点按星点"
-            : nebulaCategory.label + " · " + counts[nebulaCategory.ordinal()] + " 条记忆");
         nebulaRecords.setVisibility(nebulaEntries.isEmpty() ? View.GONE : View.VISIBLE);
         renderNebulaProgress();
         nebulaScan.setText(nebulaStop == null ? "整理已有对话" : nebulaStop.get() ? "正在停止…" : "停止整理");
