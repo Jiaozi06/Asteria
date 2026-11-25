@@ -46,6 +46,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
@@ -84,6 +85,7 @@ final class NativeChat {
     private String instructionDraft = "";
     private static final int CHAT = 0, SETTINGS = 1, API_SETTINGS = 2, FONT_SETTINGS = 3, MODEL_SETTINGS = 4, KEY_SETTINGS = 5, ABOUT = 6, INSTRUCTION_SETTINGS = 7;
     private static final int EXPERIMENTS = 8;
+    private static final int NEBULA = 9;
     private static final String PREDICTIVE_BACK = "experimentalPredictiveBack";
     private static final String BLUR_PANELS = "experimentalBlurPanels";
     private enum Motion { NONE, PUSH, POP, FADE }
@@ -103,6 +105,20 @@ final class NativeChat {
     private TextView historyCount, historyPin, historyDelete, historyEmpty;
     private HistorySelectionList historyList;
     private HistoryAdapter historyAdapter;
+    private List<MemoryNebula.Entry> nebulaEntries = Collections.emptyList();
+    private MemoryNebula.Kind nebulaCategory;
+    private boolean nebulaWorking;
+    private boolean nebulaHasLegacy;
+    private AtomicBoolean nebulaStop;
+    private int nebulaJobId;
+    private Runnable nebulaAfterReply;
+    private int nebulaLimit = 12;
+    private String nebulaStatus = "";
+    private NebulaSky nebulaSky;
+    private ScrollView nebulaScroll;
+    private HorizontalScrollView nebulaFilterStrip;
+    private LinearLayout nebulaFilters, nebulaCards;
+    private TextView nebulaCount, nebulaCaption, nebulaFeedback, nebulaScan, nebulaClear;
     private int bg, surface, ink, muted, edge, blue, tint, blueSolid;
     private LinearLayout layout, messages, attachments, tools, attachmentPanel;
     private HorizontalScrollView attachmentStrip;
@@ -304,6 +320,7 @@ final class NativeChat {
             else if (screen == ABOUT) buildAbout();
             else if (screen == INSTRUCTION_SETTINGS) buildInstructionSettings();
             else if (screen == EXPERIMENTS) buildExperiments();
+            else if (screen == NEBULA) buildNebula();
             else buildSettingsHome();
             screenView = layout;
         }
@@ -381,7 +398,7 @@ final class NativeChat {
                 returnToChat(false);
                 return true;
             }
-            if (screen == FONT_SETTINGS || screen == ABOUT || screen == EXPERIMENTS) {
+            if (screen == FONT_SETTINGS || screen == ABOUT || screen == EXPERIMENTS || screen == NEBULA) {
                 screen = SETTINGS;
                 show(Motion.POP, false);
                 return true;
@@ -1171,8 +1188,19 @@ final class NativeChat {
         }
         input.clearFocus();
         services.hideKeyboard();
-        generate(json("role", "user", "text", message, "files", files, "think", think, "search", search),
-            session == null ? state.messages().length() : session.index);
+        int index = session == null ? state.messages().length() : session.index;
+        ChatState.Job job = generate(json("role", "user", "text", message, "files", files, "think", think, "search", search),
+            index);
+        if (!message.isEmpty() && services.nebulaEnabled()) {
+            NebulaSummaries.Target target = nebulaTarget();
+            nebulaJobId = job.id;
+            nebulaAfterReply = () -> services.rememberInNebula(target, string(job.chat, "id"), index, message, snapshot -> {
+                if (snapshot != null && !nebulaWorking) {
+                    updateNebulaSnapshot(snapshot);
+                    renderNebula();
+                }
+            });
+        }
     }
 
     private void beginEdit(JSONObject message, int index) {
@@ -1251,7 +1279,7 @@ final class NativeChat {
             }).setNegativeButton("取消", null).setNeutralButton("API 设置", (d,w) -> openApiSettings()).show();
         return false;
     }
-    private void generate(JSONObject user, int index) {
+    private ChatState.Job generate(JSONObject user, int index) {
         services.stopSpeaking();
         ChatState.Job job = state.start(user, index);
         saveMessages();
@@ -1261,11 +1289,17 @@ final class NativeChat {
         if (drawer.isRevealed()) refreshHistory();
         services.stream(job.id, string(job.chat, "id"), state.apiProvider(), job.endpoint, job.protocol, job.request.toString(),
             state.data.optBoolean("compactContext", true), job.contextWindow, user.optBoolean("think"), job.attachmentKey);
+        return job;
     }
     private void finish(ChatState.Job completed, String error) {
         state.finish(error);
         unfolded.remove(completed.reply);
         saveMessages();
+        if (completed.id == nebulaJobId && nebulaAfterReply != null) {
+            Runnable remember = nebulaAfterReply;
+            nebulaAfterReply = null;
+            if (error == null || error.isEmpty()) remember.run();
+        }
         if (completed.endpoint.isEmpty()) refreshBalance(true);
         if (screen == CHAT) {
             boolean follow = nearBottom();
@@ -2533,6 +2567,8 @@ final class NativeChat {
         divider(connection);
         settingsRow(connection, R.drawable.ic_import_history, "导入 DeepSeek 对话", "", this::showHistoryImport);
         divider(connection);
+        settingsRow(connection, R.drawable.ic_mark, "记忆星云", "", this::openNebula);
+        divider(connection);
         settingsRow(connection, R.drawable.ic_trash, "清空全部对话", "", this::confirmClearHistory);
         divider(connection);
         LinearLayout compressionRow = settingsLine(connection, R.drawable.ic_compress);
@@ -2601,6 +2637,280 @@ final class NativeChat {
             screen = ABOUT;
             show(Motion.PUSH, false);
         });
+    }
+
+    private void openNebula() {
+        if (!nebulaWorking) {
+            nebulaWorking = true;
+            nebulaStatus = "正在读取记忆…";
+            services.readNebula(entries -> nebulaCompleted(entries, "", "无法读取本机记忆"));
+        }
+        nebulaCategory = null;
+        nebulaLimit = 12;
+        screen = NEBULA;
+        show(Motion.PUSH, false);
+    }
+
+    private void buildNebula() {
+        header("记忆星云", R.drawable.ic_back, "返回", this::back, false);
+        nebulaScroll = new ScrollView(context);
+        nebulaScroll.setClipToPadding(false);
+        nebulaScroll.setVerticalScrollBarEnabled(false);
+        layout.addView(nebulaScroll, new LinearLayout.LayoutParams(MATCH_PARENT, 0, 1));
+        LinearLayout body = vertical();
+        pad(body, 16, 13);
+        nebulaScroll.addView(body, MATCH_PARENT, WRAP_CONTENT);
+        boolean wide = context.getResources().getConfiguration().screenWidthDp >= 720;
+        LinearLayout overview = body, library = body;
+        if (wide) {
+            LinearLayout columns = horizontal();
+            columns.setGravity(Gravity.TOP);
+            columns.setBaselineAligned(false);
+            overview = vertical();
+            library = vertical();
+            LinearLayout.LayoutParams left = new LinearLayout.LayoutParams(0, WRAP_CONTENT, 44);
+            left.setMarginEnd(dp(18));
+            columns.addView(overview, left);
+            columns.addView(library, new LinearLayout.LayoutParams(0, WRAP_CONTENT, 56));
+            body.addView(columns, MATCH_PARENT, WRAP_CONTENT);
+        }
+
+        FrameLayout sky = new FrameLayout(context);
+        sky.setBackground(box(0xff141c35, 0, 23));
+        sky.setClipToOutline(true);
+        nebulaSky = new NebulaSky(context, kind -> {
+            chooseNebulaCategory(kind);
+            if (!wide) nebulaScroll.smoothScrollTo(0, Math.max(0, nebulaFilterStrip.getTop() - dp(9)));
+        });
+        sky.addView(nebulaSky, MATCH_PARENT, MATCH_PARENT);
+        LinearLayout summary = vertical();
+        pad(summary, 19, 15);
+        TextView local = text("本机存储", 12, 0xffb9c7e8);
+        summary.addView(local, WRAP_CONTENT, WRAP_CONTENT);
+        nebulaCount = text("", 28, 0xfff2f5ff);
+        bold(nebulaCount);
+        summary.addView(nebulaCount, WRAP_CONTENT, WRAP_CONTENT);
+        sky.addView(summary, new FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.TOP | Gravity.START));
+        nebulaCaption = text("", 12, 0xffc2cee7);
+        FrameLayout.LayoutParams caption = new FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.BOTTOM | Gravity.START);
+        caption.setMarginStart(dp(19));
+        caption.bottomMargin = dp(15);
+        sky.addView(nebulaCaption, caption);
+        overview.addView(sky, MATCH_PARENT, dp(242));
+
+        LinearLayout management = settingsGroup(overview, "整理与管理");
+        LinearLayout recording = settingsLine(management, R.drawable.ic_insight);
+        Switch automatic = new Switch(context);
+        automatic.setText("自动总结");
+        automatic.setTextColor(ink);
+        automatic.setTextSize(15);
+        automatic.setChecked(services.nebulaEnabled());
+        automatic.setPaddingRelative(dp(11), 0, 0, 0);
+        automatic.setOnCheckedChangeListener((view, enabled) -> services.setNebulaEnabled(enabled));
+        recording.addView(automatic, new LinearLayout.LayoutParams(0, MATCH_PARENT, 1));
+        divider(management);
+        LinearLayout actions = horizontal();
+        nebulaScan = action("整理已有对话", this::collectNebula);
+        nebulaClear = action("清空星云", () -> confirmNebulaDelete(null));
+        styleNebulaDelete(nebulaClear, false);
+        actions.addView(nebulaScan, new LinearLayout.LayoutParams(0, dp(47), 1));
+        actions.addView(nebulaClear, new LinearLayout.LayoutParams(0, dp(47), 1));
+        management.addView(actions, MATCH_PARENT, WRAP_CONTENT);
+        settingsNote(overview, "整理时会把你发出的部分文字交给当前配置的 " + state.providerName(state.apiProvider())
+            + " API。摘要只保存在本机，与对话记录独立，不参与聊天回复。");
+        nebulaFeedback = text("", 13, muted);
+        pad(nebulaFeedback, 3, 5);
+        nebulaFeedback.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
+        overview.addView(nebulaFeedback, MATCH_PARENT, WRAP_CONTENT);
+
+        label(library, "记忆记录");
+        nebulaFilterStrip = new HorizontalScrollView(context);
+        nebulaFilterStrip.setHorizontalScrollBarEnabled(false);
+        nebulaFilters = horizontal();
+        nebulaFilterStrip.addView(nebulaFilters, WRAP_CONTENT, WRAP_CONTENT);
+        library.addView(nebulaFilterStrip, MATCH_PARENT, WRAP_CONTENT);
+        nebulaCards = vertical();
+        library.addView(nebulaCards, MATCH_PARENT, WRAP_CONTENT);
+        gap(body, 10);
+        renderNebula();
+    }
+
+    private void chooseNebulaCategory(MemoryNebula.Kind kind) {
+        nebulaCategory = kind;
+        nebulaLimit = 12;
+        renderNebula();
+    }
+
+    private void renderNebula() {
+        if (screen != NEBULA || nebulaSky == null) return;
+        int[] counts = new int[MemoryNebula.Kind.values().length];
+        for (MemoryNebula.Entry entry : nebulaEntries) counts[entry.kind.ordinal()]++;
+        int active = 0;
+        for (int count : counts) if (count > 0) active++;
+        nebulaSky.update(counts, nebulaCategory);
+        nebulaCount.setText(nebulaEntries.size() + " 条记忆");
+        nebulaCaption.setText("分布在 " + active + " 个类别");
+        nebulaCaption.setVisibility(active == 0 ? View.GONE : View.VISIBLE);
+        String feedback = nebulaStatus.isEmpty() && nebulaHasLegacy ? "有旧星云记录等待重新总结" : nebulaStatus;
+        nebulaFeedback.setText(feedback);
+        nebulaFeedback.setVisibility(feedback.isEmpty() ? View.GONE : View.VISIBLE);
+        nebulaScan.setText(nebulaStop == null ? "整理已有对话" : nebulaStop.get() ? "正在停止…" : "停止整理");
+        enableHistoryButton(nebulaScan, !nebulaWorking || (nebulaStop != null && !nebulaStop.get()));
+        enableHistoryButton(nebulaClear, !nebulaWorking && (!nebulaEntries.isEmpty() || nebulaHasLegacy));
+
+        nebulaFilters.removeAllViews();
+        addNebulaFilter(null, "全部");
+        for (MemoryNebula.Kind kind : MemoryNebula.Kind.values()) addNebulaFilter(kind, kind.label);
+        nebulaCards.removeAllViews();
+        int count = 0;
+        for (MemoryNebula.Entry entry : nebulaEntries) {
+            if (nebulaCategory != null && entry.kind != nebulaCategory) continue;
+            if (++count <= nebulaLimit) addNebulaCard(entry);
+        }
+        if (count == 0 && !nebulaWorking) {
+            TextView empty = text(nebulaEntries.isEmpty() ? "整理已有对话，或开启自动总结。" : "该类别还没有记忆。", 14, muted);
+            pad(empty, 3, 15);
+            nebulaCards.addView(empty, MATCH_PARENT, WRAP_CONTENT);
+        } else if (count > nebulaLimit) {
+            nebulaCards.addView(action("显示更多", () -> {
+                nebulaLimit += 12;
+                renderNebula();
+            }), MATCH_PARENT, WRAP_CONTENT);
+        }
+    }
+
+    private void addNebulaFilter(MemoryNebula.Kind kind, String name) {
+        boolean selected = nebulaCategory == kind;
+        TextView filter = action(name, () -> chooseNebulaCategory(kind));
+        filter.setTextSize(13);
+        filter.setTextColor(selected ? blue : muted);
+        filter.setSelected(selected);
+        filter.setMinHeight(dp(40));
+        buttonBackground(filter, selected ? tint : surface, selected ? blue : edge, 17);
+        LinearLayout.LayoutParams style = new LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT);
+        style.setMarginEnd(dp(7));
+        nebulaFilters.addView(filter, style);
+    }
+
+    private void addNebulaCard(MemoryNebula.Entry entry) {
+        LinearLayout card = horizontal();
+        card.setGravity(Gravity.TOP);
+        pad(card, 13, 11);
+        card.setBackground(box(surface, edge, 16));
+        LinearLayout.LayoutParams space = new LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT);
+        space.topMargin = dp(8);
+        nebulaCards.addView(card, space);
+
+        View dot = new View(context);
+        dot.setBackground(box(entry.kind.color, 0, 6));
+        LinearLayout.LayoutParams marker = new LinearLayout.LayoutParams(dp(8), dp(8));
+        marker.topMargin = dp(5);
+        marker.setMarginEnd(dp(10));
+        card.addView(dot, marker);
+        LinearLayout copy = vertical();
+        card.addView(copy, new LinearLayout.LayoutParams(0, WRAP_CONTENT, 1));
+        copy.addView(text(entry.kind.label, 12, muted), MATCH_PARENT, WRAP_CONTENT);
+        TextView title = text(entry.title, 15, ink);
+        bold(title);
+        pad(title, 0, 3);
+        copy.addView(title, MATCH_PARENT, WRAP_CONTENT);
+        if (!entry.detail.isEmpty()) {
+            TextView detail = text(entry.detail, 14, ink);
+            pad(detail, 0, 3);
+            copy.addView(detail, MATCH_PARENT, WRAP_CONTENT);
+        }
+        LocalDate updated = Instant.ofEpochMilli(entry.updated).atZone(ZoneId.systemDefault()).toLocalDate();
+        String date = updated.getMonthValue() + "月" + updated.getDayOfMonth() + "日记录";
+        if (entry.mentions > 1) date = "提及 " + entry.mentions + " 次 · " + date;
+        copy.addView(text(date, 12, muted), MATCH_PARENT, WRAP_CONTENT);
+        ImageButton remove = icon(R.drawable.ic_trash, "删除记忆 " + title.getText(), () -> confirmNebulaDelete(entry));
+        remove.setImageTintList(ColorStateList.valueOf(muted));
+        card.addView(remove, dp(44), dp(44));
+    }
+
+    private NebulaSummaries.Target nebulaTarget() {
+        ApiProvider provider = state.apiProvider();
+        String endpoint = state.endpoint();
+        ApiProtocol protocol = state.apiProtocol();
+        String model = state.preferredModel(provider, endpoint);
+        return new NebulaSummaries.Target(provider, protocol, endpoint, model,
+            state.preferredContextWindow(provider, endpoint, protocol, model));
+    }
+
+    private void collectNebula() {
+        if (nebulaStop != null) {
+            nebulaStop.set(true);
+            nebulaStatus = "正在保存已完成的摘要…";
+            renderNebula();
+            return;
+        }
+        if (nebulaWorking) return;
+        List<String> ids = new ArrayList<>();
+        for (JSONObject chat : state.history("", Collections.emptySet())) ids.add(string(chat, "id"));
+        if (ids.isEmpty() && !nebulaHasLegacy) {
+            toast("还没有可整理的对话");
+            return;
+        }
+        NebulaSummaries.Target target = nebulaTarget();
+        if (!hasKey || target.model.isEmpty()) {
+            toast("请先在设置里配置模型和 API");
+            return;
+        }
+        nebulaWorking = true;
+        nebulaStop = new AtomicBoolean();
+        nebulaStatus = "正在调用 API 总结…";
+        renderNebula();
+        services.collectNebula(target, ids, nebulaStop, count -> {
+            if (nebulaStop == null || nebulaStop.get()) return;
+            nebulaStatus = "已处理 " + count + " 条，继续整理中…";
+            if (screen == NEBULA) nebulaFeedback.setText(nebulaStatus);
+        }, (snapshot, status) -> {
+            nebulaStop = null;
+            nebulaWorking = false;
+            if (snapshot != null) updateNebulaSnapshot(snapshot);
+            nebulaStatus = snapshot == null ? "无法读取本机记忆" : status;
+            renderNebula();
+        });
+    }
+
+    private void confirmNebulaDelete(MemoryNebula.Entry entry) {
+        if (nebulaWorking) return;
+        Dialog dialog = newSheet();
+        boolean all = entry == null;
+        LinearLayout panel = settingsSheet(dialog, all ? "清空记忆星云？" : "删除这条记忆？");
+        settingsNote(panel, all ? "将删除全部星云记录。" : entry.detail.isEmpty() ? entry.title : entry.detail);
+        TextView confirm = sheetActions(panel, "取消", dialog::dismiss, all ? "清空星云" : "删除", () -> {
+            dialog.dismiss();
+            if (nebulaWorking) return;
+            nebulaWorking = true;
+            nebulaStatus = "正在保存…";
+            renderNebula();
+            services.deleteNebula(all ? null : entry.id,
+                entries -> nebulaCompleted(entries, all ? "已清空星云" : "已删除记忆", "无法删除记忆，请重试"));
+        });
+        styleNebulaDelete(confirm, true);
+        showSheet(dialog, panel);
+    }
+
+    private void styleNebulaDelete(TextView button, boolean confirm) {
+        int fill = confirm ? (dark ? 0xff322d2f : 0xfff4eeee) : 0;
+        int press = dark ? 0x28e4b4b4 : 0x1aad5f64;
+        button.setTextColor(dark ? 0xffe6a9ab : 0xff9e454c);
+        button.setBackground(new RippleDrawable(ColorStateList.valueOf(press), box(fill, 0, 12),
+            box(0xffffffff, 0, 12)));
+    }
+
+    private void updateNebulaSnapshot(MemoryNebula.Snapshot snapshot) {
+        nebulaEntries = snapshot.entries;
+        nebulaHasLegacy = snapshot.hasLegacy;
+    }
+
+    private void nebulaCompleted(MemoryNebula.Snapshot snapshot, String success, String failure) {
+        nebulaWorking = false;
+        if (snapshot != null) updateNebulaSnapshot(snapshot);
+        nebulaStatus = snapshot == null ? failure : "";
+        if (snapshot != null && !success.isEmpty() && screen == NEBULA) toast(success);
+        renderNebula();
     }
 
     private void buildExperiments() {

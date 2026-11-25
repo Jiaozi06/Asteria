@@ -38,7 +38,10 @@ import java.util.Arrays;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BiConsumer;
 import java.util.function.Consumer;
+import java.util.function.IntConsumer;
 import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
@@ -50,6 +53,7 @@ public final class MainActivity extends Activity {
     private static final int PICK_HISTORY = 13;
     private static final int CAMERA_GRANT = Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION;
     private static final long MIB = 1024 * 1024;
+    private static final ExecutorService NEBULA_WORKER = Executors.newSingleThreadExecutor();
     private static boolean startedInProcess;
     private final ExecutorService worker = Executors.newCachedThreadPool();
     private final Map<Integer, DeepSeek.Request> streams = new ConcurrentHashMap<>();
@@ -57,6 +61,8 @@ public final class MainActivity extends Activity {
     private FrameLayout root;
     private KeyVault vault;
     private ConversationStorage history;
+    private MemoryNebula nebula;
+    private volatile boolean closingNebula;
     private final Services services = new Services();
     private final RequestLog requestLog = new RequestLog();
     private Recording recording;
@@ -83,6 +89,7 @@ public final class MainActivity extends Activity {
         speech = new PhoneSpeech(this, id -> emit("speech", json("id", id)),
             message -> emit("toast", json("message", message)));
         history = new ConversationStorage(getFilesDir());
+        nebula = new MemoryNebula(getApplicationContext());
         root = new FrameLayout(this);
         root.getViewTreeObserver().addOnGlobalLayoutListener(() -> {
             if (screen != null) screen.updateInputHint();
@@ -202,6 +209,8 @@ public final class MainActivity extends Activity {
         speech.shutdown();
         for (DeepSeek.Request request : streams.values()) cancel(request);
         worker.execute(history::close);
+        closingNebula = true;
+        NEBULA_WORKER.execute(nebula::close);
         worker.shutdown();
         super.onDestroy();
     }
@@ -302,6 +311,78 @@ public final class MainActivity extends Activity {
         }
 
         boolean saveState(JSONObject value, boolean saveActiveMessages) { return history.save(value, saveActiveMessages); }
+
+        boolean nebulaEnabled() { return getPreferences(MODE_PRIVATE).getBoolean("nebulaApiAutomatic", false); }
+
+        void setNebulaEnabled(boolean enabled) {
+            getPreferences(MODE_PRIVATE).edit().putBoolean("nebulaApiAutomatic", enabled).apply();
+        }
+
+        void rememberInNebula(NebulaSummaries.Target target, String chatId, int index, String text, Consumer<MemoryNebula.Snapshot> done) {
+            if (text.isEmpty() || !nebulaEnabled()) return;
+            readNebulaAfter(() -> {
+                nebula.remember(chatId, index, text, target.batchChars(), nebulaSummarizer(target),
+                    () -> closingNebula || !nebulaEnabled());
+                return nebula.snapshot();
+            }, done);
+        }
+
+        void readNebula(Consumer<MemoryNebula.Snapshot> done) { readNebulaAfter(nebula::snapshot, done); }
+
+        void collectNebula(NebulaSummaries.Target target, List<String> chatIds, AtomicBoolean stop,
+                IntConsumer progress, BiConsumer<MemoryNebula.Snapshot, String> done) {
+            NEBULA_WORKER.execute(() -> {
+                if (closingNebula) return;
+                String status;
+                try {
+                    nebula.collect(chatIds, history::messages, target.batchChars(), nebulaSummarizer(target),
+                        () -> closingNebula || stop.get(), count -> postNebula(() -> progress.accept(count)));
+                    status = stop.get() ? "已停止整理" : "整理完成";
+                } catch (CancellationException error) {
+                    status = "已停止整理";
+                } catch (Exception error) {
+                    status = "API 总结未完成，可再次整理";
+                }
+                MemoryNebula.Snapshot snapshot = nebulaSnapshot(nebula::snapshot);
+                String result = status;
+                postNebula(() -> done.accept(snapshot, result));
+            });
+        }
+
+        private MemoryNebula.Summarize nebulaSummarizer(NebulaSummaries.Target target) {
+            return inputs -> {
+                String key = vault.read(target.endpoint);
+                if (ApiProvider.requiresKey(target.endpoint) && key.isEmpty()) throw new DeepSeek.ApiError("请先配置当前 API");
+                DeepSeek.Request request = apiRequest(target.provider);
+                try { return NebulaSummaries.request(request, target, key, inputs); }
+                finally { request.close(); }
+            };
+        }
+
+        void deleteNebula(String id, Consumer<MemoryNebula.Snapshot> done) {
+            readNebulaAfter(() -> {
+                if (id == null) nebula.clear();
+                else nebula.remove(id);
+                return nebula.snapshot();
+            }, done);
+        }
+
+        private MemoryNebula.Snapshot nebulaSnapshot(Callable<MemoryNebula.Snapshot> action) {
+            try { return action.call(); }
+            catch (Exception error) { return null; }
+        }
+
+        private void postNebula(Runnable action) {
+            runOnUiThread(() -> { if (!isFinishing() && !isDestroyed()) action.run(); });
+        }
+
+        private void readNebulaAfter(Callable<MemoryNebula.Snapshot> action, Consumer<MemoryNebula.Snapshot> done) {
+            NEBULA_WORKER.execute(() -> {
+                if (closingNebula) return;
+                MemoryNebula.Snapshot result = nebulaSnapshot(action);
+                postNebula(() -> done.accept(result));
+            });
+        }
 
         JSONArray loadMessages(String id) {
             try { return history.messages(id); }
