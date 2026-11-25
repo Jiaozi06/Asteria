@@ -2754,7 +2754,7 @@ final class NativeChat {
             brand.addView(versionLabel, MATCH_PARENT, WRAP_CONTENT);
         }
         gap(brand, 11);
-        TextView description = text("原生 Android 聊天客户端，支持 DeepSeek 和 OpenAI 兼容接口。", 14, muted);
+        TextView description = text("原生 Android AI 聊天客户端。\n支持多渠道接入，可导入 DeepSeek 对话，按模型设置上下文窗口。", 14, muted);
         description.setGravity(Gravity.CENTER);
         pad(description, 16, 0);
         brand.addView(description, MATCH_PARENT, WRAP_CONTENT);
