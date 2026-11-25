@@ -6,6 +6,7 @@ import android.app.Dialog;
 import android.content.Context;
 import android.content.pm.PackageManager;
 import android.content.res.ColorStateList;
+import android.graphics.Rect;
 import android.graphics.Typeface;
 import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.Drawable;
@@ -1737,11 +1738,6 @@ final class NativeChat {
         popup.setElevation(dp(9));
         popup.setEnterTransition(new Fade().setDuration(135));
         popup.setExitTransition(new Fade().setDuration(100));
-        if (chat != state.current()) {
-            Drawable previous = anchor.getBackground();
-            anchor.setBackground(historyRowBackground(dark ? 0xff2b2d31 : 0xffededf0));
-            popup.setOnDismissListener(() -> anchor.setBackground(previous));
-        }
 
         historyMenuItem(menu, popup, R.drawable.ic_edit, "重命名", ink, () ->
             editDialog("重命名对话", string(chat, "title"), "确认", title -> {
@@ -1761,7 +1757,37 @@ final class NativeChat {
             toggleHistorySelection(chat);
         });
         historyMenuItem(menu, popup, R.drawable.ic_trash, "删除", dangerColor(), () -> confirmDelete(Collections.singleton(id)));
-        popup.showAsDropDown(anchor, 0, dp(5), Gravity.RIGHT);
+        Rect visible = new Rect();
+        root.getWindowVisibleDisplayFrame(visible);
+        int[] rootLocation = new int[2];
+        root.getLocationOnScreen(rootLocation);
+        int gap = dp(5);
+        int top = Math.max(visible.top, rootLocation[1] + root.getPaddingTop()) + gap;
+        int bottom = Math.min(visible.bottom, rootLocation[1] + root.getHeight() - root.getPaddingBottom()) - gap;
+        if (bottom <= top) return;
+
+        menu.measure(View.MeasureSpec.makeMeasureSpec(popup.getWidth(), View.MeasureSpec.EXACTLY),
+            View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED));
+        int height = Math.min(menu.getMeasuredHeight(), bottom - top);
+        if (height < menu.getMeasuredHeight()) {
+            ScrollView scroll = new ScrollView(context);
+            scroll.addView(menu, MATCH_PARENT, WRAP_CONTENT);
+            popup.setContentView(scroll);
+        }
+        popup.setHeight(height);
+
+        int[] row = new int[2];
+        anchor.getLocationOnScreen(row);
+        int rowBottom = row[1] + anchor.getHeight();
+        int below = rowBottom + gap;
+        int desiredTop = below + height <= bottom ? below : row[1] - gap - height;
+        int popupTop = Math.max(top, Math.min(desiredTop, bottom - height));
+        if (chat != state.current()) {
+            Drawable previous = anchor.getBackground();
+            anchor.setBackground(historyRowBackground(dark ? 0xff2b2d31 : 0xffededf0));
+            popup.setOnDismissListener(() -> anchor.setBackground(previous));
+        }
+        popup.showAsDropDown(anchor, 0, popupTop - rowBottom, Gravity.RIGHT);
     }
 
     private void historyMenuItem(LinearLayout menu, PopupWindow popup, int graphic, String name, int color, Runnable run) {
@@ -1987,6 +2013,21 @@ final class NativeChat {
             screen = FONT_SETTINGS;
             show(Motion.PUSH, false);
         });
+
+        divider(appearance);
+        LinearLayout teenRow = settingsLine(appearance, R.drawable.ic_shield);
+        Switch teen = new Switch(context);
+        teen.setText("未成年人模式");
+        teen.setTextColor(ink);
+        teen.setTextSize(15);
+        teen.setChecked(state.data.optBoolean("teenMode"));
+        teen.setPaddingRelative(dp(11), 0, 0, 0);
+        teen.setOnCheckedChangeListener((view, enabled) -> {
+            put(state.data, "teenMode", enabled);
+            save();
+        });
+        teenRow.addView(teen, new LinearLayout.LayoutParams(0, MATCH_PARENT, 1));
+        settingsNote(body, "开启后，后续请求会引导模型给出适龄回复。实际效果取决于所用模型。");
 
         LinearLayout about = settingsGroup(body, "关于");
         settingsRow(about, R.drawable.ic_continue, "检查更新", appVersion(), () -> {
