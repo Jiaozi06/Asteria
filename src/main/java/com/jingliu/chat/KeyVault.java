@@ -142,6 +142,8 @@ final class KeyVault {
         return key == null ? "" : key.value;
     }
 
+    synchronized List<Credential> balanceCredentials() throws Exception { return load(""); }
+
     synchronized Credential forAttachment(String endpoint, String id) {
         try {
             for (Credential key : load(endpoint)) if (id.isEmpty() || key.id.equals(id)) return key;

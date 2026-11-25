@@ -88,6 +88,15 @@ final class DeepSeek {
         return checkedBody(connection, null);
     }
 
+    static JSONObject balance(Request request, String key) throws Exception {
+        HttpURLConnection connection = request.open("/user/balance", "GET", key);
+        connection.setConnectTimeout(7_000);
+        connection.setReadTimeout(7_000);
+        try (InputStream input = checkedBody(connection)) {
+            return new JSONObject(new String(read(input, 16 * 1024), StandardCharsets.UTF_8));
+        }
+    }
+
     private static InputStream checkedBody(HttpURLConnection connection, RequestLog.Entry trace) throws IOException {
         int status = connection.getResponseCode();
         if (trace != null) trace.status(status);

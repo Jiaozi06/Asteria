@@ -67,10 +67,14 @@ public final class MainActivity extends Activity {
     private PhoneSpeech speech;
     private boolean checkingUpdate, manualUpdate;
     private Runnable pendingActivityResult;
+    private Runnable unregisterBack;
 
     @Override protected void onStart() {
         super.onStart();
-        if (screen != null) services.checkUpdate(false);
+        if (screen != null) {
+            services.checkUpdate(false);
+            screen.refreshBalance(false);
+        }
     }
 
     @Override public void onCreate(Bundle saved) {
@@ -168,6 +172,20 @@ public final class MainActivity extends Activity {
         if (screen == null || !screen.back()) super.onBackPressed();
     }
 
+    void updateSystemBack() {
+        if (Build.VERSION.SDK_INT < 33 || screen == null) return;
+        if (screen.handlesBack()) {
+            if (unregisterBack == null) unregisterBack = AndroidWindowEffects.registerBack(getWindow(),
+                () -> screen.back(), screen::previewBack, screen::cancelBackPreview);
+        } else releaseSystemBack();
+    }
+
+    private void releaseSystemBack() {
+        if (unregisterBack == null) return;
+        unregisterBack.run();
+        unregisterBack = null;
+    }
+
     @Override protected void onStop() {
         super.onStop();
         if (recording != null) {
@@ -179,6 +197,7 @@ public final class MainActivity extends Activity {
     }
 
     @Override protected void onDestroy() {
+        releaseSystemBack();
         if (screen != null) screen.closeHistoryProgress();
         speech.shutdown();
         for (DeepSeek.Request request : streams.values()) cancel(request);
@@ -336,6 +355,23 @@ public final class MainActivity extends Activity {
         }
 
         boolean hasKey(String endpoint) { return !vault.read(endpoint).isEmpty(); }
+
+        void deepSeekBalance(Consumer<String> done) {
+            worker.execute(() -> {
+                String label = "";
+                try {
+                    DeepSeekBalance balance = new DeepSeekBalance();
+                    for (KeyVault.Credential credential : vault.balanceCredentials()) {
+                        DeepSeek.Request request = apiRequest(ApiProvider.DEEPSEEK);
+                        try { balance.add(DeepSeek.balance(request, credential.value)); }
+                        finally { request.close(); }
+                    }
+                    label = balance.label();
+                } catch (Exception ignored) { }
+                String result = label;
+                runOnUiThread(() -> { if (!isDestroyed() && !isFinishing()) done.accept(result); });
+            });
+        }
 
         List<KeyVault.Entry> savedKeys(String endpoint) throws Exception { return vault.entries(endpoint); }
 

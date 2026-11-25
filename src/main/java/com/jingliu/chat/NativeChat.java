@@ -14,6 +14,8 @@ import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.RippleDrawable;
 import android.net.Uri;
+import android.os.Build;
+import android.os.SystemClock;
 import android.text.InputType;
 import android.text.TextUtils;
 import android.transition.ChangeBounds;
@@ -78,6 +80,9 @@ final class NativeChat {
     private EditText instructionEditor;
     private String instructionDraft = "";
     private static final int CHAT = 0, SETTINGS = 1, API_SETTINGS = 2, FONT_SETTINGS = 3, MODEL_SETTINGS = 4, KEY_SETTINGS = 5, ABOUT = 6, INSTRUCTION_SETTINGS = 7;
+    private static final int EXPERIMENTS = 8;
+    private static final String PREDICTIVE_BACK = "experimentalPredictiveBack";
+    private static final String BLUR_PANELS = "experimentalBlurPanels";
     private enum Motion { NONE, PUSH, POP, FADE }
     private static final PathInterpolator EASE = new PathInterpolator(.22f, .75f, .23f, 1f);
     private View screenView;
@@ -108,6 +113,12 @@ final class NativeChat {
     private EditSession editing;
     private ScrollView transcript;
     private TextView welcome, chatTitle, chatModel, think, search, keyFeedback, verify, saveOnly, manageKeys;
+    private TextView balanceFooter;
+    private String balanceLabel = "";
+    private long balanceRefreshAfter;
+    private int balanceConfig;
+    private boolean balanceRunning, balanceRefreshPending;
+    private final Runnable fetchBalance = this::fetchBalance;
     private TextView voicePad;
     private FrameLayout voiceOverlay;
     private VoiceHalo voiceHalo;
@@ -165,6 +176,56 @@ final class NativeChat {
         String endpoint = state.endpoint();
         hasKey = !state.effectiveModel().isEmpty() && (!state.custom() || !endpoint.isEmpty())
             && (!ApiProvider.requiresKey(endpoint) || services.hasKey(endpoint));
+        invalidateBalance();
+    }
+
+    private boolean supportsBalance() {
+        return hasKey && state.apiProvider() == ApiProvider.DEEPSEEK && state.endpoint().isEmpty();
+    }
+
+    private void invalidateBalance() {
+        balanceConfig++;
+        balanceRefreshAfter = 0;
+        balanceRefreshPending = false;
+        balanceLabel = "";
+        root.removeCallbacks(fetchBalance);
+        updateBalanceFooter();
+        refreshBalance(false);
+    }
+
+    void refreshBalance(boolean afterReply) {
+        if (afterReply) balanceRefreshAfter = 0;
+        if (screen != CHAT || !supportsBalance() || SystemClock.uptimeMillis() < balanceRefreshAfter) return;
+        root.removeCallbacks(fetchBalance);
+        root.postDelayed(fetchBalance, afterReply ? 900 : 0);
+    }
+
+    private void fetchBalance() {
+        if (screen != CHAT || !supportsBalance()) return;
+        if (balanceRunning) {
+            balanceRefreshPending = true;
+            return;
+        }
+        balanceRunning = true;
+        balanceRefreshAfter = SystemClock.uptimeMillis() + 60_000;
+        int config = balanceConfig;
+        services.deepSeekBalance(label -> {
+            balanceRunning = false;
+            if (config == balanceConfig && supportsBalance()) {
+                balanceLabel = label;
+                updateBalanceFooter();
+            }
+            if (balanceRefreshPending) {
+                balanceRefreshPending = false;
+                refreshBalance(false);
+            }
+        });
+    }
+
+    private void updateBalanceFooter() {
+        if (balanceFooter == null) return;
+        balanceFooter.setText(balanceLabel);
+        balanceFooter.setVisibility(balanceLabel.isEmpty() || !supportsBalance() ? View.GONE : View.VISIBLE);
     }
 
     private void colors() {
@@ -239,11 +300,14 @@ final class NativeChat {
             else if (screen == MODEL_SETTINGS) buildModelSettings();
             else if (screen == ABOUT) buildAbout();
             else if (screen == INSTRUCTION_SETTINGS) buildInstructionSettings();
+            else if (screen == EXPERIMENTS) buildExperiments();
             else buildSettingsHome();
             screenView = layout;
         }
         root.addView(screenView, new FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT));
         if (screen == CHAT && reopenDrawer) drawer.restoreOpen();
+        host.updateSystemBack();
+        refreshBalance(false);
         if (previous == null) return;
         if (motion == Motion.NONE || !ValueAnimator.areAnimatorsEnabled() || root.getWidth() == 0) {
             root.removeView(previous);
@@ -282,6 +346,19 @@ final class NativeChat {
         save();
     }
 
+    boolean handlesBack() {
+        return screen != CHAT || (drawer != null && drawer.isRevealed()) || attachmentPanelOpen || editing != null || voiceMode;
+    }
+
+    void previewBack(float progress) {
+        if (screen == CHAT && drawer != null && !managingHistory && state.data.optBoolean(PREDICTIVE_BACK)
+            && ValueAnimator.areAnimatorsEnabled()) drawer.previewBack(progress);
+    }
+
+    void cancelBackPreview() {
+        if (screen == CHAT && drawer != null) drawer.cancelBackPreview();
+    }
+
     boolean back() {
         if (screen != CHAT) {
             services.hideKeyboard();
@@ -301,7 +378,7 @@ final class NativeChat {
                 returnToChat(false);
                 return true;
             }
-            if (screen == FONT_SETTINGS || screen == ABOUT) {
+            if (screen == FONT_SETTINGS || screen == ABOUT || screen == EXPERIMENTS) {
                 screen = SETTINGS;
                 show(Motion.POP, false);
                 return true;
@@ -613,10 +690,17 @@ final class NativeChat {
         attachmentAction("文件", R.drawable.ic_paperclip, () -> selectAttachment(key -> services.pickFile(false, key)));
         footer.addView(attachmentPanel, MATCH_PARENT, WRAP_CONTENT);
         setAttachmentPanel(attachmentPanelOpen, false);
-        TextView note = text("回答由 AI 生成，仅供参考", 11, dark ? 0xff9299a3 : 0xff697486);
-        note.setGravity(Gravity.CENTER);
-        footer.addView(note, MATCH_PARENT, WRAP_CONTENT);
-        note.setMinHeight(dp(24));
+        int footerColor = dark ? 0xff9299a3 : 0xff697486;
+        LinearLayout footnote = horizontal();
+        footnote.setGravity(Gravity.CENTER);
+        footnote.setMinimumHeight(dp(24));
+        footnote.addView(text("回答由 AI 生成，仅供参考", 11, footerColor), WRAP_CONTENT, WRAP_CONTENT);
+        balanceFooter = text("", 11, footerColor);
+        LinearLayout.LayoutParams balanceArea = new LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT);
+        balanceArea.setMarginStart(dp(10));
+        footnote.addView(balanceFooter, balanceArea);
+        footer.addView(footnote, MATCH_PARENT, WRAP_CONTENT);
+        updateBalanceFooter();
 
         watch(input, value -> { draft = value; controls(); });
         renderMessages(true);
@@ -761,6 +845,7 @@ final class NativeChat {
         if (voiceMode == enabled) return;
         voiceMode = enabled;
         services.saveVoiceInputMode(enabled);
+        host.updateSystemBack();
     }
 
     private void applyVoiceText(String text) {
@@ -936,6 +1021,7 @@ final class NativeChat {
         attachmentPanel.setVisibility(open ? View.VISIBLE : View.GONE);
         add.setImageResource(open ? R.drawable.ic_close : R.drawable.ic_attach);
         add.setContentDescription(open ? "收起附件选项" : "添加附件");
+        if (changed) host.updateSystemBack();
         if (follow) bottom();
     }
 
@@ -974,8 +1060,9 @@ final class NativeChat {
         return false;
     }
     private void activate(JSONObject chat) {
-        if (chat != null && chat == state.current()) {
-            drawer.close();
+        if (chat == state.current()) {
+            if (chat == null) toast("已经在新对话中");
+            else drawer.close();
             return;
         }
         if (!mayChange()) return;
@@ -1093,6 +1180,7 @@ final class NativeChat {
 
     private void updateEditLayout(boolean animate) {
         boolean modifying = editing != null;
+        host.updateSystemBack();
         boolean motion = animate && ValueAnimator.areAnimatorsEnabled();
         if (motion) {
             TransitionSet transition = new TransitionSet().addTransition(new Fade()).addTransition(new ChangeBounds());
@@ -1146,6 +1234,7 @@ final class NativeChat {
         state.finish(error);
         unfolded.remove(completed.reply);
         saveMessages();
+        if (completed.endpoint.isEmpty()) refreshBalance(true);
         if (screen == CHAT) {
             boolean follow = nearBottom();
             if (ValueAnimator.areAnimatorsEnabled() && liveReply != null && !answer(liveReply).isEmpty()) {
@@ -1429,7 +1518,14 @@ final class NativeChat {
                 | WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN);
         }
         dialog.show();
-        if (window != null) window.setLayout(bottom ? MATCH_PARENT : Math.min(dp(360), root.getWidth() - dp(48)), WRAP_CONTENT);
+        if (window == null) return;
+        window.setLayout(bottom ? MATCH_PARENT : Math.min(dp(360), root.getWidth() - dp(48)), WRAP_CONTENT);
+        if (Build.VERSION.SDK_INT >= 31 && state.data.optBoolean(BLUR_PANELS)) {
+            AndroidWindowEffects.blurPanelBackdrop(window, Math.min(dp(18), 64));
+        }
+        if (Build.VERSION.SDK_INT >= 34 && state.data.optBoolean(PREDICTIVE_BACK)) {
+            AndroidWindowEffects.animatePanelBack(dialog, window, panel, bottom, dp(96));
+        }
     }
 
     private LinearLayout settingsSheet(Dialog dialog, String heading) {
@@ -1802,6 +1898,7 @@ final class NativeChat {
         setAttachmentPanel(false, false);
         services.hideKeyboard();
         refreshHistory();
+        host.updateSystemBack();
     }
 
     private void onHistoryClosed() {
@@ -1814,6 +1911,7 @@ final class NativeChat {
         if (!historyFilter.isEmpty()) historySearch.setText("");
         updateHistoryMode();
         refreshHistory();
+        host.updateSystemBack();
     }
 
     private void updateHistoryMode() {
@@ -2439,6 +2537,12 @@ final class NativeChat {
         });
 
         divider(appearance);
+        settingsRow(appearance, R.drawable.ic_insight, "实验性功能", "", () -> {
+            screen = EXPERIMENTS;
+            show(Motion.PUSH, false);
+        });
+
+        divider(appearance);
         LinearLayout teenRow = settingsLine(appearance, R.drawable.ic_shield);
         Switch teen = new Switch(context);
         teen.setText("未成年人模式");
@@ -2463,6 +2567,50 @@ final class NativeChat {
             screen = ABOUT;
             show(Motion.PUSH, false);
         });
+    }
+
+    private void buildExperiments() {
+        header("实验性功能", R.drawable.ic_back, "返回", this::back, false);
+        ScrollView scroll = new ScrollView(context);
+        layout.addView(scroll, new LinearLayout.LayoutParams(MATCH_PARENT, 0, 1));
+        LinearLayout body = vertical();
+        pad(body, 16, 10);
+        scroll.addView(body, MATCH_PARENT, WRAP_CONTENT);
+
+        LinearLayout gestures = settingsGroup(body, "手势");
+        experimentSwitch(gestures, R.drawable.ic_back, "预测性返回", PREDICTIVE_BACK, 34);
+        settingsNote(body, Build.VERSION.SDK_INT >= 34
+            ? "使用系统返回手势时，侧栏和面板会随手势收起。取消手势可回到原位。"
+            : "应用内返回预览需要 Android 14 或更新版本。");
+
+        LinearLayout panels = settingsGroup(body, "视觉效果");
+        experimentSwitch(panels, R.drawable.ic_theme, "弹窗毛玻璃", BLUR_PANELS, 31);
+        if (Build.VERSION.SDK_INT >= 31) {
+            divider(panels);
+            settingsRow(panels, R.drawable.ic_insight, "预览弹窗", "", () -> composerNotice("效果预览",
+                "开启毛玻璃后，弹窗背后的页面会变模糊。也可以在这里试试返回手势。", null, null));
+        }
+        settingsNote(body, Build.VERSION.SDK_INT >= 31
+            ? "设备或系统暂时停用窗口模糊时，弹窗会使用普通遮罩。"
+            : "弹窗毛玻璃需要 Android 12 或更新版本。");
+    }
+
+    private void experimentSwitch(LinearLayout group, int icon, String label, String key, int minSdk) {
+        LinearLayout row = settingsLine(group, icon);
+        Switch toggle = new Switch(context);
+        toggle.setText(label);
+        toggle.setTextColor(ink);
+        toggle.setTextSize(15);
+        toggle.setPaddingRelative(dp(11), 0, 0, 0);
+        boolean available = Build.VERSION.SDK_INT >= minSdk;
+        toggle.setEnabled(available);
+        toggle.setAlpha(available ? 1f : .55f);
+        toggle.setChecked(available && state.data.optBoolean(key));
+        toggle.setOnCheckedChangeListener((view, enabled) -> {
+            put(state.data, key, enabled);
+            save();
+        });
+        row.addView(toggle, new LinearLayout.LayoutParams(0, MATCH_PARENT, 1));
     }
 
     private void showHistoryImport() {
@@ -3135,6 +3283,7 @@ final class NativeChat {
         sheetActions(panel, "取消", dialog::dismiss, "保存", () -> {
             if (!enabled.isChecked()) {
                 services.disableProxy(provider);
+                if (provider == ApiProvider.DEEPSEEK) invalidateBalance();
                 dialog.dismiss();
                 return;
             }
@@ -3174,6 +3323,7 @@ final class NativeChat {
                 toast("无法保存 SOCKS5 设置");
                 return;
             }
+            if (provider == ApiProvider.DEEPSEEK) invalidateBalance();
             dialog.dismiss();
         });
         showSheet(dialog, panel);
@@ -3328,6 +3478,7 @@ final class NativeChat {
             });
         });
         settingsNote(body, "每条普通对话请求按策略选择一把密钥。含附件的对话沿用附件密钥。");
+        if (endpoint.isEmpty()) settingsNote(body, "页脚的密钥合计按币种相加。同一账号的多把密钥可能重复计入同一笔余额。");
 
         LinearLayout keys = settingsGroup(body, "已保存的密钥");
         try {

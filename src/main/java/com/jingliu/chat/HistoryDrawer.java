@@ -24,7 +24,7 @@ final class HistoryDrawer extends FrameLayout {
     private final Runnable onClosed;
     private final int slop;
     private final float density;
-    private float progress, downX, downY, dragStart;
+    private float progress, downX, downY, dragStart, backStart = -1f;
     private boolean revealed, touching, dragging, settleOpen;
     private ValueAnimator animator;
     private VelocityTracker velocity;
@@ -75,11 +75,30 @@ final class HistoryDrawer extends FrameLayout {
 
     boolean isRevealed() { return revealed; }
 
-    void open() { settle(true, true); }
+    void open() {
+        backStart = -1f;
+        settle(true, true);
+    }
 
     void restoreOpen() { settle(true, false); }
 
-    void close() { settle(false, true); }
+    void close() {
+        backStart = -1f;
+        settle(false, true);
+    }
+
+    void previewBack(float fraction) {
+        if (!revealed || dragging) return;
+        if (backStart < 0f) {
+            stopAnimation();
+            backStart = progress;
+        }
+        position(backStart * (1f - fraction));
+    }
+
+    void cancelBackPreview() {
+        if (backStart >= 0f) open();
+    }
 
     private void reveal() {
         if (revealed) return;
